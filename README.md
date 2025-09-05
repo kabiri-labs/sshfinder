@@ -14,7 +14,7 @@ sshfinder is a fast and efficient tool for scanning open SSH ports on a target s
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/ahmad-kabiri/sshfinder.git
+   git clone https://github.com/kabiri-labs/sshfinder.git
 
 2. **Clone the Repository**
 
@@ -62,4 +62,5 @@ sshfinder is a fast and efficient tool for scanning open SSH ports on a target s
 ## Requirements
    
    Python 3.6 or newer
+
 
