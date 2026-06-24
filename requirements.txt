@@ -1,2 +1,8 @@
-paramiko
-scapy
+# Core scanning and SSH validation work with the Python standard library
+# alone. The dependencies below enable optional, stronger features.
+
+# Optional: full SSH handshake validation (--validate paramiko).
+paramiko>=3.0
+
+# Optional: half-open SYN scanning (--scan-method syn). Requires root.
+scapy>=2.5
