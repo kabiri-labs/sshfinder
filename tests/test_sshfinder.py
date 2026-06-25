@@ -4,6 +4,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 import pytest
 
@@ -98,6 +99,7 @@ def test_host_result_as_dict_sorts():
     d = result.as_dict()
     assert d["open_ports"] == [22, 80]
     assert d["ssh_ports"] == [22]
+    assert d["ssh_sockets"] == ["h:22"]
     assert d["banners"] == {"22": "SSH-2.0-OpenSSH"}
 
 
@@ -117,6 +119,32 @@ def test_render_text_contains_summary():
     text = sshfinder.render_text(results)
     assert "Scanned 1 host(s)" in text
     assert "no open ports" in text
+
+
+def test_render_text_shows_sockets_per_host():
+    results = [
+        sshfinder.HostResult(
+            host="10.0.0.1",
+            open_ports=[22],
+            ssh_ports=[22],
+            banners={22: "SSH-2.0-OpenSSH_9.0"},
+        ),
+        sshfinder.HostResult(
+            host="10.0.0.2",
+            open_ports=[2222],
+            ssh_ports=[2222],
+            banners={2222: "SSH-2.0-dropbear"},
+        ),
+    ]
+    text = sshfinder.render_text(results)
+    # Open ports and SSH services are shown as host:port sockets.
+    assert "open: 10.0.0.1:22" in text
+    assert "SSH  10.0.0.1:22" in text
+    assert "SSH  10.0.0.2:2222" in text
+    # Consolidated socket list makes multi-host results unambiguous.
+    assert "SSH services found (2):" in text
+    assert "  10.0.0.1:22" in text
+    assert "  10.0.0.2:2222" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +211,61 @@ def test_scan_host_end_to_end(fake_ssh_server):
     )
     assert result.ssh_ports == [fake_ssh_server]
     assert result.error is None
+
+
+def test_progress_log_emits_socket(capsys):
+    reporter = sshfinder.ProgressReporter(total=1, enabled=False, quiet=False)
+    reporter.log("  [+] open   10.0.0.1:22")
+    captured = capsys.readouterr()
+    assert "10.0.0.1:22" in captured.err
+
+
+def test_scan_targets_stops_on_signal(fake_ssh_server, monkeypatch):
+    """A SIGINT mid-scan must stop promptly and return partial results."""
+    import signal as _signal
+
+    real_signal = _signal.signal
+    captured_handler = {}
+
+    def fake_signal(signum, handler):
+        # Capture only the scan's handler, not its later restoration.
+        if (
+            signum == _signal.SIGINT
+            and callable(handler)
+            and "fn" not in captured_handler
+        ):
+            captured_handler["fn"] = handler
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(_signal, "signal", fake_signal)
+
+    # Many hosts, all the closed loopback port, so the scan would run a while.
+    hosts = [f"127.0.0.{i}" for i in range(1, 40)]
+
+    def fire_interrupt():
+        time.sleep(0.2)
+        handler = captured_handler.get("fn")
+        if handler:
+            handler(_signal.SIGINT, None)
+
+    firer = threading.Thread(target=fire_interrupt, daemon=True)
+    firer.start()
+    start = time.monotonic()
+    results = sshfinder.scan_targets(
+        hosts,
+        [1],
+        scan_method="connect",
+        validate="none",
+        timeout=2.0,
+        workers=10,
+        retries=0,
+        host_concurrency=4,
+    )
+    elapsed = time.monotonic() - start
+    firer.join(timeout=2)
+    # Stopped well before a full sequential run and returned a list.
+    assert elapsed < 5.0
+    assert isinstance(results, list)
 
 
 def test_connect_scan_closed_port():
