@@ -45,9 +45,18 @@ speed.
 git clone https://github.com/kabiri-labs/sshfinder.git
 cd sshfinder
 
-# Optional extras (paramiko for deep validation, scapy for SYN scans):
+# Installs paramiko (recommended: enables the full --audit deep checks and
+# --validate paramiko):
 pip install -r requirements.txt
+
+# Optional, only for half-open SYN scans (needs root):
+pip install scapy>=2.5
 ```
+
+The core connect scan, banner validation and the dependency-free parts of
+`--audit` (algorithm inventory, weak-crypto flags, Terrapin) work without any
+third-party packages; paramiko unlocks host-key fingerprints, auth-method
+enumeration and shared-key correlation.
 
 Requires **Python 3.9+**.
 
