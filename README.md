@@ -18,6 +18,12 @@ speed.
   (RFC 4253) by default, with optional full Paramiko handshake validation.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
+- **Live progress & responsive Ctrl+C** — a real-time progress indicator
+  shows the scan is working, and interrupting cancels queued work and exits
+  promptly with partial results.
+- **Clear host status** — distinguishes open, closed, and *filtered* ports,
+  so a firewalled or unreachable host is reported as such instead of looking
+  like a hang.
 - **Machine-readable output** — human-friendly text or `--json`, optionally
   written to a file.
 
@@ -51,11 +57,18 @@ python sshfinder.py [targets ...] [options]
 | `-t, --timeout SECONDS` | Per-connection timeout (default: `2.0`). |
 | `-w, --workers N` | Concurrent probes per host (default: `200`). |
 | `--host-concurrency N` | Hosts scanned in parallel (default: `16`). |
-| `-r, --retries N` | Retries for timed-out probes (default: `1`). |
+| `-r, --retries N` | Retries for timed-out probes (default: `0`). |
 | `--json` | Emit results as JSON. |
 | `-o, --output FILE` | Write results to a file instead of stdout. |
-| `-v, -vv` | Increase verbosity. |
-| `-q, --quiet` | Suppress progress logging. |
+| `--no-progress` | Disable the live progress indicator. |
+| `-v` | Verbose (debug) logging. |
+| `-q, --quiet` | Suppress progress and informational logging. |
+
+> **Note on slow scans.** Scanning the full `1-65535` range against a
+> firewalled or unreachable host is inherently slow: every filtered port must
+> wait out the timeout. The progress indicator shows it is still working, and
+> Ctrl+C stops it promptly. To go faster, narrow the ports (e.g.
+> `-p 22,2222`), lower the timeout (`-t 1`), or raise concurrency (`-w`).
 
 `auto` selects the SYN scan when running as root with Scapy installed,
 and otherwise falls back to the privilege-free connect scan.

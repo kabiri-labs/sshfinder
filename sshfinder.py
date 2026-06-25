@@ -30,11 +30,13 @@ import logging
 import os
 import socket
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Optional
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -42,11 +44,17 @@ LOGGER = logging.getLogger("sshfinder")
 DEFAULT_PORTS = "1-65535"
 DEFAULT_TIMEOUT = 2.0
 DEFAULT_WORKERS = 200
-DEFAULT_RETRIES = 1
+DEFAULT_RETRIES = 0
+DEFAULT_HOST_CONCURRENCY = 16
 MAX_PORT = 65535
 SSH_BANNER_PREFIX = b"SSH-"
 # Identification string we present when probing, per RFC 4253.
 CLIENT_BANNER = b"SSH-2.0-sshfinder\r\n"
+
+# Per-port probe outcomes.
+OPEN = "open"
+CLOSED = "closed"
+FILTERED = "filtered"
 
 
 # --------------------------------------------------------------------------- #
@@ -60,7 +68,14 @@ class HostResult:
     open_ports: list[int] = field(default_factory=list)
     ssh_ports: list[int] = field(default_factory=list)
     banners: dict[int, str] = field(default_factory=dict)
+    closed: int = 0
+    filtered: int = 0
     error: Optional[str] = None
+
+    @property
+    def responsive(self) -> bool:
+        """True if the host answered at least one probe (open or closed)."""
+        return bool(self.open_ports) or self.closed > 0
 
     def as_dict(self) -> dict:
         return {
@@ -68,8 +83,61 @@ class HostResult:
             "open_ports": sorted(self.open_ports),
             "ssh_ports": sorted(self.ssh_ports),
             "banners": {str(p): b for p, b in sorted(self.banners.items())},
+            "closed": self.closed,
+            "filtered": self.filtered,
+            "responsive": self.responsive,
             "error": self.error,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Live progress reporting
+# --------------------------------------------------------------------------- #
+class ProgressReporter:
+    """Thread-safe, throttled progress indicator written to stderr.
+
+    It is safe to call :meth:`tick` from many worker threads at once; output
+    is rate-limited so it never floods the terminal.
+    """
+
+    def __init__(self, total: int, enabled: bool, interval: float = 0.3):
+        self.total = max(0, total)
+        self.enabled = enabled
+        self.interval = interval
+        self.done = 0
+        self.open = 0
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+        self._last = 0.0
+        self._active = False
+
+    def tick(self, n: int = 1, opened: int = 0) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self.done += n
+            self.open += opened
+            now = time.monotonic()
+            if now - self._last >= self.interval or self.done >= self.total:
+                self._last = now
+                self._render(now)
+
+    def _render(self, now: float) -> None:
+        elapsed = now - self._start
+        pct = (self.done / self.total * 100.0) if self.total else 100.0
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - self.done) / rate if rate > 0 else 0.0
+        self._active = True
+        sys.stderr.write(
+            f"\r  scanning {self.done}/{self.total} ({pct:5.1f}%) "
+            f"| open: {self.open} | {rate:6.0f}/s | ETA {eta:5.0f}s   "
+        )
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self.enabled and self._active:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +250,7 @@ def has_raw_socket_privilege() -> bool:
     """Best-effort check for the privileges required by a SYN scan."""
     if hasattr(os, "geteuid"):
         return os.geteuid() == 0
-    return False  # Non-POSIX: assume no raw-socket access.
+    return False  # Non-POSIX (e.g. Windows): assume no raw-socket access.
 
 
 def resolve_scan_method(requested: str) -> str:
@@ -211,56 +279,94 @@ def connect_scan_host(
     timeout: float,
     workers: int,
     retries: int,
-) -> list[int]:
+    stop_event: Optional[threading.Event] = None,
+    progress: Optional[ProgressReporter] = None,
+) -> tuple[list[int], int, int]:
     """Concurrent TCP connect scan of a single host.
 
-    Returns the sorted list of ports that accepted a connection.
+    Returns ``(open_ports, closed_count, filtered_count)``. The scan unwinds
+    promptly when ``stop_event`` is set, cancelling any not-yet-started probes
+    so a Ctrl+C does not block on a huge backlog of queued work.
     """
     open_ports: list[int] = []
+    closed = 0
+    filtered = 0
     if not ports:
-        return open_ports
+        return open_ports, closed, filtered
 
-    # Cap the worker pool so we never create more threads than there is work.
     pool_size = max(1, min(workers, len(ports)))
-    with ThreadPoolExecutor(max_workers=pool_size) as executor:
-        future_to_port = {
-            executor.submit(_probe_port, host, port, timeout, retries): port
-            for port in ports
-        }
-        for future in as_completed(future_to_port):
-            port = future_to_port[future]
+    executor = ThreadPoolExecutor(max_workers=pool_size)
+    futures = {
+        executor.submit(_probe_port, host, port, timeout, retries, stop_event): port
+        for port in ports
+    }
+    try:
+        for future in as_completed(futures):
+            if stop_event is not None and stop_event.is_set():
+                break
+            port = futures[future]
             try:
-                if future.result():
-                    open_ports.append(port)
+                status = future.result()
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.debug("probe %s:%s failed: %s", host, port, exc)
-    return sorted(open_ports)
+                status = FILTERED
+            if status == OPEN:
+                open_ports.append(port)
+            elif status == CLOSED:
+                closed += 1
+            else:
+                filtered += 1
+            if progress is not None:
+                progress.tick(1, opened=1 if status == OPEN else 0)
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
+    return sorted(open_ports), closed, filtered
 
 
-def _probe_port(host: str, port: int, timeout: float, retries: int) -> bool:
-    """Return True if a TCP connection to ``host:port`` succeeds."""
+def _probe_port(
+    host: str,
+    port: int,
+    timeout: float,
+    retries: int,
+    stop_event: Optional[threading.Event] = None,
+) -> str:
+    """Probe a single TCP port and classify the outcome.
+
+    Returns one of ``OPEN``, ``CLOSED`` or ``FILTERED``.
+    """
     last_attempt = retries + 1
-    for attempt in range(last_attempt):
+    for _ in range(last_attempt):
+        if stop_event is not None and stop_event.is_set():
+            return FILTERED
         try:
             with socket.create_connection((host, port), timeout=timeout):
-                return True
+                return OPEN
         except ConnectionRefusedError:
-            # Host is reachable but the port is closed; retrying won't help.
-            return False
+            return CLOSED  # Reachable host, port closed (RST).
+        except ConnectionResetError:
+            return CLOSED
+        except socket.timeout:
+            continue  # No response; retry if budget remains.
         except OSError:
-            # Timeouts and transient errors are worth retrying.
-            if attempt + 1 >= last_attempt:
-                return False
-    return False
+            # Network unreachable, DNS failure, etc. Treat as filtered.
+            return FILTERED
+    return FILTERED
 
 
-def syn_scan_host(host: str, ports: list[int], timeout: float) -> list[int]:
-    """Half-open SYN scan of a single host using Scapy. Requires root."""
+def syn_scan_host(
+    host: str, ports: list[int], timeout: float
+) -> tuple[list[int], int, int]:
+    """Half-open SYN scan of a single host using Scapy. Requires root.
+
+    Returns ``(open_ports, closed_count, filtered_count)``.
+    """
     from scapy.all import IP, TCP, sr, send, conf  # Imported lazily.
 
     conf.verb = 0
     if not ports:
-        return []
+        return [], 0, 0
 
     try:
         resolved = socket.gethostbyname(host)
@@ -268,16 +374,22 @@ def syn_scan_host(host: str, ports: list[int], timeout: float) -> list[int]:
         raise RuntimeError(f"cannot resolve {host}: {exc}") from exc
 
     open_ports: set[int] = set()
+    closed = 0
     packets = IP(dst=resolved) / TCP(dport=ports, flags="S")
     answered, _ = sr(packets, timeout=timeout, verbose=0)
     for _, received in answered:
         tcp_layer = received.getlayer(TCP)
-        if tcp_layer is not None and tcp_layer.flags == 0x12:  # SYN/ACK
+        if tcp_layer is None:
+            continue
+        if tcp_layer.flags == 0x12:  # SYN/ACK -> open
             open_ports.add(int(tcp_layer.sport))
             # Politely tear down the half-open connection with a RST.
             send(IP(dst=resolved) / TCP(dport=tcp_layer.sport, flags="R"),
                  verbose=0)
-    return sorted(open_ports)
+        elif tcp_layer.flags == 0x14:  # RST/ACK -> closed
+            closed += 1
+    filtered = max(0, len(ports) - len(answered))
+    return sorted(open_ports), closed, filtered
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +446,7 @@ def validate_ssh_ports(
     timeout: float,
     workers: int,
     method: str,
+    stop_event: Optional[threading.Event] = None,
 ) -> dict[int, str]:
     """Validate which of ``ports`` serve SSH, concurrently.
 
@@ -345,16 +458,22 @@ def validate_ssh_ports(
     validator = validate_ssh_paramiko if method == "paramiko" else grab_ssh_banner
     confirmed: dict[int, str] = {}
     pool_size = max(1, min(workers, len(ports)))
-    with ThreadPoolExecutor(max_workers=pool_size) as executor:
-        future_to_port = {
-            executor.submit(validator, host, port, timeout): port
-            for port in ports
-        }
-        for future in as_completed(future_to_port):
-            port = future_to_port[future]
+    executor = ThreadPoolExecutor(max_workers=pool_size)
+    futures = {
+        executor.submit(validator, host, port, timeout): port for port in ports
+    }
+    try:
+        for future in as_completed(futures):
+            if stop_event is not None and stop_event.is_set():
+                break
+            port = futures[future]
             banner = future.result()
             if banner:
                 confirmed[port] = banner
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
     return confirmed
 
 
@@ -370,27 +489,37 @@ def scan_host(
     timeout: float,
     workers: int,
     retries: int,
+    stop_event: Optional[threading.Event] = None,
+    progress: Optional[ProgressReporter] = None,
 ) -> HostResult:
     """Scan a single host end to end: port scan then SSH validation."""
     result = HostResult(host=host)
     try:
         if scan_method == "syn":
-            result.open_ports = syn_scan_host(host, ports, timeout)
+            open_ports, closed, filtered = syn_scan_host(host, ports, timeout)
+            if progress is not None:
+                progress.tick(len(ports), opened=len(open_ports))
         else:
-            result.open_ports = connect_scan_host(
-                host, ports, timeout, workers, retries
+            open_ports, closed, filtered = connect_scan_host(
+                host, ports, timeout, workers, retries, stop_event, progress
             )
+        result.open_ports = open_ports
+        result.closed = closed
+        result.filtered = filtered
     except Exception as exc:
         result.error = str(exc)
         LOGGER.debug("scan of %s failed: %s", host, exc)
         return result
 
-    if result.open_ports:
+    interrupted = stop_event is not None and stop_event.is_set()
+    if result.open_ports and not interrupted:
         banners = validate_ssh_ports(
-            host, result.open_ports, timeout, workers, validate
+            host, result.open_ports, timeout, workers, validate, stop_event
         )
         result.banners = banners
         result.ssh_ports = sorted(banners)
+        if result.ssh_ports:
+            LOGGER.info("SSH confirmed on %s port(s): %s", host, result.ssh_ports)
     return result
 
 
@@ -404,34 +533,67 @@ def scan_targets(
     workers: int,
     retries: int,
     host_concurrency: int,
+    progress: Optional[ProgressReporter] = None,
 ) -> list[HostResult]:
-    """Scan many hosts concurrently and return their results."""
-    results: list[HostResult] = []
+    """Scan many hosts concurrently and return their results.
+
+    Honours Ctrl+C: on interrupt, in-flight host scans are given a brief grace
+    period to wind down and report partial results, and all queued work is
+    cancelled so the program exits promptly instead of draining the backlog.
+    """
+    stop_event = threading.Event()
+    results_map: dict[str, HostResult] = {}
     pool_size = max(1, min(host_concurrency, len(hosts)))
-    with ThreadPoolExecutor(max_workers=pool_size) as executor:
-        futures = {
-            executor.submit(
-                scan_host,
-                host,
-                ports,
-                scan_method=scan_method,
-                validate=validate,
-                timeout=timeout,
-                workers=workers,
-                retries=retries,
-            ): host
-            for host in hosts
-        }
+    executor = ThreadPoolExecutor(max_workers=pool_size)
+    futures = {
+        executor.submit(
+            scan_host,
+            host,
+            ports,
+            scan_method=scan_method,
+            validate=validate,
+            timeout=timeout,
+            workers=workers,
+            retries=retries,
+            stop_event=stop_event,
+            progress=progress,
+        ): host
+        for host in hosts
+    }
+    try:
         for future in as_completed(futures):
             host = futures[future]
             try:
-                results.append(future.result())
+                results_map[host] = future.result()
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.error("unexpected error scanning %s: %s", host, exc)
-                results.append(HostResult(host=host, error=str(exc)))
-    # Preserve the input ordering for stable, readable output.
-    order = {host: i for i, host in enumerate(hosts)}
-    results.sort(key=lambda r: order.get(r.host, len(order)))
+                results_map[host] = HostResult(host=host, error=str(exc))
+    except KeyboardInterrupt:
+        stop_event.set()
+        LOGGER.warning("Interrupt received - stopping scan (winding down)...")
+        # Let running host scans observe stop_event and return partials.
+        wait(list(futures), timeout=timeout + 1.0)
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
+
+    # Gather any results that completed during shutdown/grace period.
+    for future, host in futures.items():
+        if host in results_map or future.cancelled() or not future.done():
+            continue
+        try:
+            results_map[host] = future.result()
+        except Exception as exc:  # pragma: no cover - defensive
+            results_map[host] = HostResult(host=host, error=str(exc))
+
+    results = [results_map[h] for h in hosts if h in results_map]
+    if len(results) < len(hosts):
+        LOGGER.warning(
+            "Partial results: %d of %d host(s) completed before stopping",
+            len(results),
+            len(hosts),
+        )
     return results
 
 
@@ -447,7 +609,18 @@ def render_text(results: list[HostResult]) -> str:
             lines.append(f"  error: {result.error}")
             continue
         if not result.open_ports:
-            lines.append("  no open ports found")
+            if result.filtered and not result.responsive:
+                lines.append(
+                    "  no open ports - host did not respond "
+                    f"({result.filtered} filtered); likely firewalled or down"
+                )
+            elif result.filtered:
+                lines.append(
+                    f"  no open ports ({result.closed} closed, "
+                    f"{result.filtered} filtered)"
+                )
+            else:
+                lines.append("  no open ports (host reachable, all closed)")
             continue
         lines.append(f"  open ports: {', '.join(map(str, result.open_ports))}")
         if result.ssh_ports:
@@ -460,8 +633,7 @@ def render_text(results: list[HostResult]) -> str:
             lines.append("  no SSH services confirmed")
     lines.append("")
     lines.append(
-        f"Scanned {len(results)} host(s); "
-        f"confirmed {total_ssh} SSH service(s)."
+        f"Scanned {len(results)} host(s); confirmed {total_ssh} SSH service(s)."
     )
     return "\n".join(lines)
 
@@ -524,8 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--host-concurrency",
         type=int,
-        default=16,
-        help="Number of hosts scanned in parallel (default: 16).",
+        default=DEFAULT_HOST_CONCURRENCY,
+        help=f"Hosts scanned in parallel (default: {DEFAULT_HOST_CONCURRENCY}).",
     )
     parser.add_argument(
         "-r",
@@ -545,17 +717,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write results to a file instead of stdout.",
     )
     parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the live progress indicator.",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help="Increase verbosity (-v, -vv).",
+        help="Increase verbosity (debug logging).",
     )
     parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
-        help="Suppress progress logging.",
+        help="Suppress progress and informational logging.",
     )
     parser.add_argument(
         "--version",
@@ -568,16 +745,13 @@ def build_parser() -> argparse.ArgumentParser:
 def configure_logging(verbose: int, quiet: bool) -> None:
     if quiet:
         level = logging.ERROR
-    elif verbose >= 2:
+    elif verbose >= 1:
         level = logging.DEBUG
-    elif verbose == 1:
-        level = logging.INFO
     else:
-        level = logging.WARNING
+        level = logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(levelname)s %(message)s",
     )
 
 
@@ -604,6 +778,8 @@ def run(argv: Optional[list[str]] = None) -> int:
 
     if args.workers < 1 or args.host_concurrency < 1:
         parser.error("workers and host-concurrency must be >= 1")
+    if args.retries < 0:
+        parser.error("retries must be >= 0")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
 
@@ -614,10 +790,25 @@ def run(argv: Optional[list[str]] = None) -> int:
         parser.error("syn scan requires the optional 'scapy' dependency")
 
     LOGGER.info(
-        "Scanning %d host(s) across %d port(s) using %s scan",
+        "Scanning %d host(s) x %d port(s) using %s scan "
+        "(timeout=%.1fs, workers=%d). Press Ctrl+C to stop.",
         len(hosts),
         len(ports),
         scan_method,
+        args.timeout,
+        args.workers,
+    )
+    if scan_method == "connect" and len(ports) * len(hosts) > 5000:
+        LOGGER.info(
+            "Large scan: unresponsive/firewalled hosts make this take a "
+            "while. Narrow it with -p (e.g. -p 22,2222) to go faster."
+        )
+
+    progress_enabled = (
+        not args.quiet and not args.no_progress and sys.stderr.isatty()
+    )
+    reporter = ProgressReporter(
+        total=len(hosts) * len(ports), enabled=progress_enabled
     )
 
     try:
@@ -630,10 +821,10 @@ def run(argv: Optional[list[str]] = None) -> int:
             workers=args.workers,
             retries=args.retries,
             host_concurrency=args.host_concurrency,
+            progress=reporter,
         )
-    except KeyboardInterrupt:
-        LOGGER.error("scan aborted by user")
-        return 130
+    finally:
+        reporter.finish()
 
     output = render_json(results) if args.json else render_text(results)
     if args.output:
@@ -648,7 +839,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         print(output)
 
     # Exit non-zero only on hard errors, not on "nothing found".
-    if all(r.error for r in results) and results:
+    if results and all(r.error for r in results):
         return 1
     return 0
 
