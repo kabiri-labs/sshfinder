@@ -26,6 +26,11 @@ speed.
   load-balanced infrastructure.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
+- **Pipelined identification** — the service behind each open port is
+  identified (and audited) the instant the port is found, in parallel with the
+  rest of the port sweep. SSH services are confirmed without waiting for the
+  whole scan to finish, and every open port is labelled `[SSH]` / `[not ssh]`
+  so an open port is never mistaken for an SSH one.
 - **Live, per-socket discovery** — open ports and confirmed SSH services are
   printed the moment they are found, as `host:port`, so it is always clear
   which result belongs to which target when scanning many hosts.
