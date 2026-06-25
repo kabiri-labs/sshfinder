@@ -24,15 +24,19 @@ stricter confirmation.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
@@ -42,7 +46,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Optional
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -66,10 +70,71 @@ OPEN = "open"
 CLOSED = "closed"
 FILTERED = "filtered"
 
+# SSH binary protocol constants (RFC 4253).
+SSH_MSG_KEXINIT = 20
+# Username presented for the unauthenticated "none" auth probe used to
+# enumerate the methods a server will accept. It is not expected to succeed.
+AUTH_PROBE_USER = "sshfinder"
+
+# Deprecated / weak host-key algorithms (SHA-1 signatures, DSA).
+WEAK_HOST_KEYS = {
+    "ssh-rsa",
+    "ssh-dss",
+    "ssh-rsa-cert-v01@openssh.com",
+    "ssh-dss-cert-v01@openssh.com",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Result model
 # --------------------------------------------------------------------------- #
+@dataclass
+class SSHAudit:
+    """Security-relevant facts about a single SSH service.
+
+    Gathered without authenticating: the cryptographic algorithms a server
+    offers, its host key fingerprint, the authentication methods it accepts,
+    and derived findings (weak algorithms, Terrapin exposure).
+    """
+
+    host: str
+    port: int
+    server_version: str = ""
+    host_key_type: str = ""
+    host_key_fingerprint: str = ""
+    auth_methods: list[str] = field(default_factory=list)
+    kex_algorithms: list[str] = field(default_factory=list)
+    host_key_algorithms: list[str] = field(default_factory=list)
+    ciphers: list[str] = field(default_factory=list)
+    macs: list[str] = field(default_factory=list)
+    weaknesses: list[str] = field(default_factory=list)
+    terrapin_vulnerable: Optional[bool] = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def password_auth(self) -> bool:
+        """True if the server accepts a password-style login (brute-forceable)."""
+        return any(
+            m in ("password", "keyboard-interactive") for m in self.auth_methods
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "server_version": self.server_version,
+            "host_key_type": self.host_key_type,
+            "host_key_fingerprint": self.host_key_fingerprint,
+            "auth_methods": self.auth_methods,
+            "password_auth": self.password_auth,
+            "kex_algorithms": self.kex_algorithms,
+            "host_key_algorithms": self.host_key_algorithms,
+            "ciphers": self.ciphers,
+            "macs": self.macs,
+            "weaknesses": self.weaknesses,
+            "terrapin_vulnerable": self.terrapin_vulnerable,
+            "notes": self.notes,
+        }
+
+
 @dataclass
 class HostResult:
     """Outcome of scanning a single host."""
@@ -78,6 +143,7 @@ class HostResult:
     open_ports: list[int] = field(default_factory=list)
     ssh_ports: list[int] = field(default_factory=list)
     banners: dict[int, str] = field(default_factory=dict)
+    audits: dict[int, SSHAudit] = field(default_factory=dict)
     closed: int = 0
     filtered: int = 0
     error: Optional[str] = None
@@ -94,6 +160,9 @@ class HostResult:
             "ssh_ports": sorted(self.ssh_ports),
             "ssh_sockets": [f"{self.host}:{p}" for p in sorted(self.ssh_ports)],
             "banners": {str(p): b for p, b in sorted(self.banners.items())},
+            "audit": {
+                str(p): self.audits[p].as_dict() for p in sorted(self.audits)
+            },
             "closed": self.closed,
             "filtered": self.filtered,
             "responsive": self.responsive,
@@ -514,6 +583,267 @@ def validate_ssh_ports(
 
 
 # --------------------------------------------------------------------------- #
+# SSH security audit (algorithms, host key, auth methods, Terrapin)
+# --------------------------------------------------------------------------- #
+def audit_ssh_service(
+    host: str, port: int, timeout: float, deep: bool = True
+) -> SSHAudit:
+    """Collect security-relevant facts about an SSH service without logging in.
+
+    The algorithm inventory and Terrapin assessment are derived from the
+    server's KEXINIT and need no third-party libraries. The host key
+    fingerprint and accepted authentication methods require a partial
+    handshake via Paramiko (``deep``); they are skipped gracefully if it is
+    unavailable.
+    """
+    audit = SSHAudit(host=host, port=port)
+    try:
+        kex = read_server_kexinit(host, port, timeout)
+    except OSError as exc:
+        audit.notes.append(f"kexinit read failed: {exc}")
+        kex = None
+
+    if kex:
+        audit.server_version = kex.get("banner", "")
+        audit.kex_algorithms = kex.get("kex", [])
+        audit.host_key_algorithms = kex.get("server_host_key", [])
+        audit.ciphers = _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", []))
+        audit.macs = _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))
+        audit.weaknesses = assess_weaknesses(kex)
+        audit.terrapin_vulnerable = is_terrapin_vulnerable(kex)
+
+    if deep:
+        try:
+            key_type, fingerprint, methods = _audit_with_paramiko(
+                host, port, timeout
+            )
+            audit.host_key_type = key_type
+            audit.host_key_fingerprint = fingerprint
+            audit.auth_methods = methods
+        except _ParamikoUnavailable:
+            audit.notes.append(
+                "host key / auth methods need paramiko (pip install paramiko)"
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            audit.notes.append(f"deep audit failed: {exc}")
+    return audit
+
+
+def parse_kexinit(payload: bytes) -> Optional[dict]:
+    """Parse an SSH_MSG_KEXINIT payload into its algorithm name-lists."""
+    if not payload or payload[0] != SSH_MSG_KEXINIT:
+        return None
+    offset = 1 + 16  # message type byte + 16-byte cookie
+    fields = (
+        "kex",
+        "server_host_key",
+        "enc_c2s",
+        "enc_s2c",
+        "mac_c2s",
+        "mac_s2c",
+        "comp_c2s",
+        "comp_s2c",
+        "lang_c2s",
+        "lang_s2c",
+    )
+    result: dict[str, list[str]] = {}
+    for name in fields:
+        if offset + 4 > len(payload):
+            return None
+        (length,) = struct.unpack(">I", payload[offset:offset + 4])
+        offset += 4
+        if offset + length > len(payload):
+            return None
+        raw = payload[offset:offset + length].decode("ascii", "replace")
+        offset += length
+        result[name] = raw.split(",") if raw else []
+    return result
+
+
+def read_server_kexinit(host: str, port: int, timeout: float) -> Optional[dict]:
+    """Connect, exchange identification strings and read the server KEXINIT."""
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        banner = _read_ident_line(sock)
+        if banner is None:
+            return None
+        sock.sendall(CLIENT_BANNER)
+        # First binary packet from the server is its KEXINIT. Pre-key-exchange
+        # packets are unencrypted and carry no MAC, so we can read them raw.
+        (packet_len,) = struct.unpack(">I", _recv_exact(sock, 4))
+        if not 2 <= packet_len <= 200_000:
+            return None
+        body = _recv_exact(sock, packet_len)
+        padding_len = body[0]
+        payload = body[1:packet_len - padding_len]
+        parsed = parse_kexinit(payload)
+        if parsed is None:
+            return None
+        parsed["banner"] = banner
+        return parsed
+
+
+def is_terrapin_vulnerable(kex: dict) -> bool:
+    """Assess exposure to the Terrapin prefix-truncation attack (CVE-2023-48795).
+
+    A server is exposed when it offers a vulnerable mode -- ChaCha20-Poly1305,
+    or a CBC cipher paired with an Encrypt-then-MAC algorithm -- and does not
+    advertise the strict key-exchange countermeasure.
+    """
+    if "kex-strict-s-v00@openssh.com" in kex.get("kex", []):
+        return False
+    ciphers = set(kex.get("enc_s2c", [])) | set(kex.get("enc_c2s", []))
+    macs = set(kex.get("mac_s2c", [])) | set(kex.get("mac_c2s", []))
+    if "chacha20-poly1305@openssh.com" in ciphers:
+        return True
+    has_cbc = any(c.endswith("-cbc") for c in ciphers)
+    has_etm = any(m.endswith("-etm@openssh.com") for m in macs)
+    return has_cbc and has_etm
+
+
+def assess_weaknesses(kex: dict) -> list[str]:
+    """Return human-readable findings for deprecated/weak algorithms offered."""
+    findings: list[str] = []
+    weak_kex = [k for k in kex.get("kex", []) if _is_weak_kex(k)]
+    weak_hostkey = [k for k in kex.get("server_host_key", []) if k in WEAK_HOST_KEYS]
+    ciphers = _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", []))
+    weak_ciphers = [c for c in ciphers if _is_weak_cipher(c)]
+    macs = _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))
+    weak_macs = [m for m in macs if _is_weak_mac(m)]
+    if weak_kex:
+        findings.append("weak key exchange: " + ", ".join(weak_kex))
+    if weak_hostkey:
+        findings.append("weak host key alg: " + ", ".join(weak_hostkey))
+    if weak_ciphers:
+        findings.append("weak ciphers: " + ", ".join(weak_ciphers))
+    if weak_macs:
+        findings.append("weak MACs: " + ", ".join(weak_macs))
+    return findings
+
+
+def _is_weak_kex(name: str) -> bool:
+    return "sha1" in name or name.startswith("diffie-hellman-group1-")
+
+
+def _is_weak_cipher(name: str) -> bool:
+    return (
+        name == "none"
+        or name.endswith("-cbc")
+        or name.startswith("arcfour")
+        or name.startswith("des")
+        or name.startswith("blowfish")
+        or name.startswith("cast128")
+    )
+
+
+def _is_weak_mac(name: str) -> bool:
+    return (
+        name == "none"
+        or "md5" in name
+        or "sha1" in name
+        or name.endswith("-96")
+        or name.startswith("umac-64")
+    )
+
+
+def _unique(*lists: list[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for items in lists:
+        for item in items:
+            seen.setdefault(item, None)
+    return list(seen)
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    buffer = b""
+    while len(buffer) < count:
+        chunk = sock.recv(count - len(buffer))
+        if not chunk:
+            raise OSError("connection closed mid-packet")
+        buffer += chunk
+    return buffer
+
+
+def _read_ident_line(sock: socket.socket, max_lines: int = 20) -> Optional[str]:
+    """Read the server identification line (the one starting with 'SSH-').
+
+    Reads a byte at a time so the following binary KEXINIT packet is left
+    untouched in the socket buffer.
+    """
+    for _ in range(max_lines):
+        line = b""
+        while not line.endswith(b"\n"):
+            char = sock.recv(1)
+            if not char:
+                return None
+            line += char
+            if len(line) > 1024:
+                break
+        text = line.rstrip(b"\r\n")
+        if text.startswith(SSH_BANNER_PREFIX):
+            return text.decode("latin-1", "replace")
+    return None
+
+
+class _ParamikoUnavailable(Exception):
+    """Raised when the optional Paramiko dependency is not installed."""
+
+
+def _audit_with_paramiko(
+    host: str, port: int, timeout: float
+) -> tuple[str, str, list[str]]:
+    """Return ``(host_key_type, fingerprint, auth_methods)`` via Paramiko."""
+    try:
+        import paramiko
+    except ImportError:
+        raise _ParamikoUnavailable
+
+    transport = paramiko.Transport((host, port))
+    try:
+        transport.start_client(timeout=timeout)
+        key = transport.get_remote_server_key()
+        digest = hashlib.sha256(key.asbytes()).digest()
+        fingerprint = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+        key_type = key.get_name()
+
+        auth_methods: list[str] = []
+        try:
+            transport.auth_none(AUTH_PROBE_USER)
+            # Unauthenticated login accepted (very rare / misconfigured).
+            auth_methods = ["none"]
+        except paramiko.BadAuthenticationType as exc:
+            auth_methods = list(exc.allowed_types)
+        except paramiko.AuthenticationException:
+            auth_methods = []
+        return key_type, fingerprint, auth_methods
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+def correlate_host_keys(results: list["HostResult"]) -> dict[str, list[str]]:
+    """Group sockets by shared SSH host-key fingerprint.
+
+    A fingerprint reused across multiple hosts often reveals cloned VMs,
+    shared/load-balanced backends or poor key management.
+    """
+    by_fingerprint: dict[str, list[str]] = defaultdict(list)
+    for result in results:
+        for port, audit in result.audits.items():
+            if audit.host_key_fingerprint:
+                by_fingerprint[audit.host_key_fingerprint].append(
+                    f"{result.host}:{port}"
+                )
+    return {
+        fingerprint: sorted(sockets)
+        for fingerprint, sockets in by_fingerprint.items()
+        if len(sockets) > 1
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def scan_host(
@@ -525,6 +855,7 @@ def scan_host(
     timeout: float,
     workers: int,
     retries: int,
+    audit: bool = False,
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
 ) -> HostResult:
@@ -563,7 +894,33 @@ def scan_host(
                 progress.log(message)
             else:
                 LOGGER.info("SSH on %s:%s", host, port)
+
+        if audit and not (stop_event is not None and stop_event.is_set()):
+            for port in result.ssh_ports:
+                info = audit_ssh_service(host, port, timeout)
+                result.audits[port] = info
+                _report_audit(progress, info)
     return result
+
+
+def _report_audit(
+    progress: Optional[ProgressReporter], audit: SSHAudit
+) -> None:
+    """Surface the most actionable audit findings live."""
+    alerts: list[str] = []
+    if audit.password_auth:
+        alerts.append("password-auth")
+    if audit.terrapin_vulnerable:
+        alerts.append("Terrapin-VULNERABLE")
+    if audit.weaknesses:
+        alerts.append("weak-crypto")
+    if not alerts:
+        return
+    message = f"  [audit] {audit.host}:{audit.port}  " + ", ".join(alerts)
+    if progress is not None:
+        progress.log(message)
+    else:
+        LOGGER.info("audit %s:%s %s", audit.host, audit.port, ", ".join(alerts))
 
 
 def scan_targets(
@@ -576,6 +933,7 @@ def scan_targets(
     workers: int,
     retries: int,
     host_concurrency: int,
+    audit: bool = False,
     progress: Optional[ProgressReporter] = None,
 ) -> list[HostResult]:
     """Scan many hosts concurrently and return their results.
@@ -617,6 +975,7 @@ def scan_targets(
             timeout=timeout,
             workers=workers,
             retries=retries,
+            audit=audit,
             stop_event=stop_event,
             progress=progress,
         ): host
@@ -717,10 +1076,18 @@ def render_text(results: list[HostResult]) -> str:
                 banner = result.banners.get(port, "")
                 suffix = f"  ({banner})" if banner else ""
                 lines.append(f"  SSH  {socket_str}{suffix}")
+                lines.extend(_render_audit(result.audits.get(port)))
         else:
             lines.append("  no SSH services confirmed")
 
     lines.append("")
+    shared_keys = correlate_host_keys(results)
+    if shared_keys:
+        lines.append("Shared SSH host keys (possible shared/cloned hosts):")
+        for fingerprint, sockets in sorted(shared_keys.items()):
+            lines.append(f"  {fingerprint}")
+            lines.append(f"    -> {', '.join(sockets)}")
+        lines.append("")
     if ssh_sockets:
         lines.append(f"SSH services found ({len(ssh_sockets)}):")
         lines.extend(f"  {sock}" for sock in ssh_sockets)
@@ -729,6 +1096,26 @@ def render_text(results: list[HostResult]) -> str:
         f"confirmed {len(ssh_sockets)} SSH service(s)."
     )
     return "\n".join(lines)
+
+
+def _render_audit(audit: Optional[SSHAudit]) -> list[str]:
+    """Render the indented audit detail block for a single SSH service."""
+    if audit is None:
+        return []
+    lines: list[str] = []
+    if audit.host_key_fingerprint:
+        key_type = audit.host_key_type or "host key"
+        lines.append(f"       host key: {key_type} {audit.host_key_fingerprint}")
+    if audit.auth_methods:
+        flag = "  [!] password auth enabled" if audit.password_auth else ""
+        lines.append(f"       auth: {', '.join(audit.auth_methods)}{flag}")
+    if audit.terrapin_vulnerable:
+        lines.append("       [!] Terrapin (CVE-2023-48795): VULNERABLE")
+    for finding in audit.weaknesses:
+        lines.append(f"       [!] {finding}")
+    for note in audit.notes:
+        lines.append(f"       note: {note}")
+    return lines
 
 
 def render_json(results: list[HostResult]) -> str:
@@ -771,6 +1158,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("banner", "paramiko", "none"),
         default="banner",
         help="SSH validation strategy (default: banner).",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Audit each SSH service: algorithms, host key, auth methods, "
+        "Terrapin (CVE-2023-48795) and shared-host-key correlation.",
     )
     parser.add_argument(
         "-t",
@@ -882,6 +1275,12 @@ def run(argv: Optional[list[str]] = None) -> int:
     if args.scan_method == "syn" and not _scapy_available():
         parser.error("syn scan requires the optional 'scapy' dependency")
 
+    validate = args.validate
+    if args.audit and validate == "none":
+        # Auditing needs confirmed SSH services to act on.
+        validate = "banner"
+        LOGGER.info("--audit requires SSH validation; using 'banner'")
+
     LOGGER.info(
         "Scanning %d host(s) x %d port(s) using %s scan "
         "(timeout=%.1fs, workers=%d). Press Ctrl+C to stop.",
@@ -911,11 +1310,12 @@ def run(argv: Optional[list[str]] = None) -> int:
             hosts,
             ports,
             scan_method=scan_method,
-            validate=args.validate,
+            validate=validate,
             timeout=args.timeout,
             workers=args.workers,
             retries=args.retries,
             host_concurrency=args.host_concurrency,
+            audit=args.audit,
             progress=reporter,
         )
     finally:

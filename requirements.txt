@@ -1,8 +1,10 @@
-# Core scanning and SSH validation work with the Python standard library
-# alone. The dependencies below enable optional, stronger features.
+# Core port scanning and banner-based SSH validation run on the Python
+# standard library alone. The dependencies below add stronger features.
 
-# Optional: full SSH handshake validation (--validate paramiko).
+# Recommended: host-key fingerprints, auth-method enumeration and shared-key
+# correlation in --audit, plus full-handshake validation (--validate paramiko).
 paramiko>=3.0
 
 # Optional: half-open SYN scanning (--scan-method syn). Requires root.
-scapy>=2.5
+# Install separately if you need it:  pip install scapy>=2.5
+# scapy>=2.5

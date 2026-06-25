@@ -2,6 +2,7 @@
 
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -304,3 +305,257 @@ def test_render_text_filtered_host_message():
     result = sshfinder.HostResult(host="h", filtered=100)
     text = sshfinder.render_text([result])
     assert "firewalled or down" in text
+
+
+# --------------------------------------------------------------------------- #
+# SSH audit: KEXINIT parsing, weakness flagging, Terrapin, correlation
+# --------------------------------------------------------------------------- #
+def _name_list(items):
+    data = ",".join(items).encode("ascii")
+    return struct.pack(">I", len(data)) + data
+
+
+def build_kexinit_payload(kex, hostkey, ciphers, macs):
+    """Construct a valid SSH_MSG_KEXINIT payload for tests."""
+    payload = bytes([sshfinder.SSH_MSG_KEXINIT]) + os.urandom(16)
+    payload += _name_list(kex)
+    payload += _name_list(hostkey)
+    payload += _name_list(ciphers)  # enc c2s
+    payload += _name_list(ciphers)  # enc s2c
+    payload += _name_list(macs)     # mac c2s
+    payload += _name_list(macs)     # mac s2c
+    payload += _name_list(["none"])
+    payload += _name_list(["none"])
+    payload += _name_list([])
+    payload += _name_list([])
+    payload += bytes([0]) + struct.pack(">I", 0)  # follows + reserved
+    return payload
+
+
+def packetize(payload):
+    """Wrap a payload in the SSH Binary Packet Protocol (no MAC, pre-KEX)."""
+    block = 8
+    pad = block - ((4 + 1 + len(payload)) % block)
+    if pad < 4:
+        pad += block
+    packet_length = 1 + len(payload) + pad
+    return struct.pack(">I", packet_length) + bytes([pad]) + payload + b"\x00" * pad
+
+
+def test_parse_kexinit_roundtrip():
+    payload = build_kexinit_payload(
+        kex=["curve25519-sha256", "diffie-hellman-group14-sha1"],
+        hostkey=["ssh-ed25519", "ssh-rsa"],
+        ciphers=["aes256-gcm@openssh.com", "aes128-cbc"],
+        macs=["hmac-sha2-256", "hmac-sha1"],
+    )
+    parsed = sshfinder.parse_kexinit(payload)
+    assert parsed["kex"][0] == "curve25519-sha256"
+    assert "ssh-rsa" in parsed["server_host_key"]
+    assert "aes128-cbc" in parsed["enc_s2c"]
+
+
+def test_parse_kexinit_rejects_non_kexinit():
+    assert sshfinder.parse_kexinit(b"\x05garbage") is None
+    assert sshfinder.parse_kexinit(b"") is None
+
+
+def test_assess_weaknesses_flags_legacy_algorithms():
+    kex = sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=["diffie-hellman-group1-sha1", "curve25519-sha256"],
+            hostkey=["ssh-rsa", "ssh-ed25519"],
+            ciphers=["aes128-cbc", "aes256-gcm@openssh.com", "arcfour"],
+            macs=["hmac-md5", "hmac-sha2-256", "hmac-sha1-96"],
+        )
+    )
+    findings = " ".join(sshfinder.assess_weaknesses(kex))
+    assert "key exchange" in findings
+    assert "host key" in findings
+    assert "aes128-cbc" in findings
+    assert "arcfour" in findings
+    assert "MAC" in findings
+
+
+def test_assess_weaknesses_clean_when_modern():
+    kex = sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=["curve25519-sha256"],
+            hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+    )
+    assert sshfinder.assess_weaknesses(kex) == []
+
+
+def test_terrapin_vulnerable_with_chacha_and_no_strict_kex():
+    kex = sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=["curve25519-sha256"],
+            hostkey=["ssh-ed25519"],
+            ciphers=["chacha20-poly1305@openssh.com"],
+            macs=["hmac-sha2-256"],
+        )
+    )
+    assert sshfinder.is_terrapin_vulnerable(kex) is True
+
+
+def test_terrapin_safe_when_strict_kex_advertised():
+    kex = sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=["curve25519-sha256", "kex-strict-s-v00@openssh.com"],
+            hostkey=["ssh-ed25519"],
+            ciphers=["chacha20-poly1305@openssh.com"],
+            macs=["hmac-sha2-256"],
+        )
+    )
+    assert sshfinder.is_terrapin_vulnerable(kex) is False
+
+
+def test_terrapin_cbc_etm_combination():
+    kex = sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=["curve25519-sha256"],
+            hostkey=["ssh-ed25519"],
+            ciphers=["aes128-cbc"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+    )
+    assert sshfinder.is_terrapin_vulnerable(kex) is True
+
+
+def test_correlate_host_keys_groups_shared_fingerprints():
+    a = sshfinder.SSHAudit(host="10.0.0.1", port=22,
+                           host_key_fingerprint="SHA256:AAA")
+    b = sshfinder.SSHAudit(host="10.0.0.2", port=22,
+                           host_key_fingerprint="SHA256:AAA")
+    c = sshfinder.SSHAudit(host="10.0.0.3", port=22,
+                           host_key_fingerprint="SHA256:BBB")
+    results = [
+        sshfinder.HostResult(host="10.0.0.1", ssh_ports=[22], audits={22: a}),
+        sshfinder.HostResult(host="10.0.0.2", ssh_ports=[22], audits={22: b}),
+        sshfinder.HostResult(host="10.0.0.3", ssh_ports=[22], audits={22: c}),
+    ]
+    shared = sshfinder.correlate_host_keys(results)
+    assert shared == {"SHA256:AAA": ["10.0.0.1:22", "10.0.0.2:22"]}
+
+
+def test_ssh_audit_password_auth_property():
+    assert sshfinder.SSHAudit(host="h", port=22,
+                              auth_methods=["publickey"]).password_auth is False
+    assert sshfinder.SSHAudit(host="h", port=22,
+                              auth_methods=["publickey", "password"]).password_auth
+
+
+def test_render_audit_block_shows_findings():
+    audit = sshfinder.SSHAudit(
+        host="10.0.0.1",
+        port=22,
+        host_key_type="ssh-ed25519",
+        host_key_fingerprint="SHA256:XYZ",
+        auth_methods=["publickey", "password"],
+        terrapin_vulnerable=True,
+        weaknesses=["weak ciphers: aes128-cbc"],
+    )
+    result = sshfinder.HostResult(
+        host="10.0.0.1", open_ports=[22], ssh_ports=[22], audits={22: audit}
+    )
+    text = sshfinder.render_text([result])
+    assert "host key: ssh-ed25519 SHA256:XYZ" in text
+    assert "password auth enabled" in text
+    assert "Terrapin (CVE-2023-48795): VULNERABLE" in text
+    assert "aes128-cbc" in text
+
+
+def test_read_server_kexinit_live():
+    """End-to-end raw KEXINIT read against a fake server."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    payload = build_kexinit_payload(
+        kex=["curve25519-sha256"],
+        hostkey=["ssh-ed25519"],
+        ciphers=["chacha20-poly1305@openssh.com"],
+        macs=["hmac-sha2-256"],
+    )
+
+    def serve():
+        srv.settimeout(2)
+        conn, _ = srv.accept()
+        try:
+            conn.sendall(b"SSH-2.0-FakeServer_1.0\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        kex = sshfinder.read_server_kexinit("127.0.0.1", port, timeout=2.0)
+    finally:
+        srv.close()
+        thread.join(timeout=2)
+    assert kex is not None
+    assert kex["banner"] == "SSH-2.0-FakeServer_1.0"
+    assert kex["kex"] == ["curve25519-sha256"]
+    assert sshfinder.is_terrapin_vulnerable(kex) is True
+
+
+def test_audit_with_paramiko_enumerates_auth_methods():
+    """Deep audit: host key fingerprint and accepted auth methods.
+
+    Runs a real Paramiko server so the partial handshake and the
+    unauthenticated 'none' auth probe are exercised end to end.
+    """
+    paramiko = pytest.importorskip("paramiko")
+
+    host_key = paramiko.RSAKey.generate(2048)
+
+    class _Server(paramiko.ServerInterface):
+        def get_allowed_auths(self, username):
+            return "publickey,password"
+
+        def check_auth_password(self, username, password):
+            return paramiko.AUTH_FAILED
+
+        def check_auth_publickey(self, username, key):
+            return paramiko.AUTH_FAILED
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        transport = paramiko.Transport(conn)
+        transport.add_server_key(host_key)
+        try:
+            transport.start_server(server=_Server())
+            time.sleep(1.0)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        key_type, fingerprint, methods = sshfinder._audit_with_paramiko(
+            "127.0.0.1", port, timeout=5.0
+        )
+    finally:
+        srv.close()
+        thread.join(timeout=2)
+
+    assert key_type.startswith("ssh-rsa")
+    assert fingerprint.startswith("SHA256:")
+    assert set(methods) == {"publickey", "password"}
