@@ -158,10 +158,11 @@ def fake_ssh_server():
 
 
 def test_connect_scan_finds_open_port(fake_ssh_server):
-    open_ports = sshfinder.connect_scan_host(
+    open_ports, closed, filtered = sshfinder.connect_scan_host(
         "127.0.0.1", [fake_ssh_server], timeout=1.0, workers=4, retries=0
     )
     assert open_ports == [fake_ssh_server]
+    assert filtered == 0
 
 
 def test_grab_ssh_banner_detects_ssh(fake_ssh_server):
@@ -186,7 +187,37 @@ def test_scan_host_end_to_end(fake_ssh_server):
 
 def test_connect_scan_closed_port():
     # Port 1 on loopback is almost certainly closed and refuses fast.
-    open_ports = sshfinder.connect_scan_host(
+    open_ports, closed, filtered = sshfinder.connect_scan_host(
         "127.0.0.1", [1], timeout=1.0, workers=1, retries=0
     )
     assert open_ports == []
+    assert closed + filtered == 1
+
+
+def test_probe_port_stop_event_short_circuits():
+    stop = threading.Event()
+    stop.set()
+    status = sshfinder._probe_port(
+        "127.0.0.1", 1, timeout=1.0, retries=0, stop_event=stop
+    )
+    assert status == sshfinder.FILTERED
+
+
+def test_progress_reporter_disabled_is_noop():
+    reporter = sshfinder.ProgressReporter(total=10, enabled=False)
+    reporter.tick(5, opened=1)
+    reporter.finish()  # Must not write or raise when disabled.
+    assert reporter.done == 0
+
+
+def test_host_result_responsive_flag():
+    filtered_only = sshfinder.HostResult(host="h", filtered=5)
+    assert filtered_only.responsive is False
+    with_closed = sshfinder.HostResult(host="h", closed=3, filtered=5)
+    assert with_closed.responsive is True
+
+
+def test_render_text_filtered_host_message():
+    result = sshfinder.HostResult(host="h", filtered=100)
+    text = sshfinder.render_text([result])
+    assert "firewalled or down" in text
