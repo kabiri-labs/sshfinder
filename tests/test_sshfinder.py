@@ -559,3 +559,77 @@ def test_audit_with_paramiko_enumerates_auth_methods():
     assert key_type.startswith("ssh-rsa")
     assert fingerprint.startswith("SHA256:")
     assert set(methods) == {"publickey", "password"}
+
+
+# --------------------------------------------------------------------------- #
+# Pipelined service identification and open-port annotation
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def fake_non_ssh_server():
+    """A TCP server that accepts connections but does not speak SSH."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def serve():
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                conn.recv(64)
+                conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    yield port
+    stop.set()
+    srv.close()
+    thread.join(timeout=2)
+
+
+def test_scan_host_classifies_non_ssh_open_port(fake_non_ssh_server):
+    result = sshfinder.scan_host(
+        "127.0.0.1",
+        [fake_non_ssh_server],
+        scan_method="connect",
+        validate="banner",
+        timeout=1.0,
+        workers=4,
+        retries=0,
+    )
+    assert result.open_ports == [fake_non_ssh_server]
+    assert result.ssh_ports == []           # open but not SSH
+    assert result.service_checked is True
+
+
+def test_render_text_annotates_service_type():
+    result = sshfinder.HostResult(
+        host="10.0.0.1",
+        open_ports=[22, 8080],
+        ssh_ports=[22],
+        banners={22: "SSH-2.0-OpenSSH_9.0"},
+        service_checked=True,
+    )
+    text = sshfinder.render_text([result])
+    assert "10.0.0.1:22 [SSH]" in text
+    assert "10.0.0.1:8080 [not ssh]" in text
+
+
+def test_render_text_marks_unknown_when_not_validated():
+    result = sshfinder.HostResult(
+        host="10.0.0.1", open_ports=[1234], service_checked=False
+    )
+    text = sshfinder.render_text([result])
+    assert "10.0.0.1:1234 [service unknown]" in text

@@ -44,7 +44,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 __version__ = "2.3.0"
 
@@ -146,6 +146,7 @@ class HostResult:
     audits: dict[int, SSHAudit] = field(default_factory=dict)
     closed: int = 0
     filtered: int = 0
+    service_checked: bool = False
     error: Optional[str] = None
 
     @property
@@ -165,6 +166,7 @@ class HostResult:
             },
             "closed": self.closed,
             "filtered": self.filtered,
+            "service_checked": self.service_checked,
             "responsive": self.responsive,
             "error": self.error,
         }
@@ -383,13 +385,17 @@ def connect_scan_host(
     retries: int,
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
+    on_open: Optional[Callable[[int], None]] = None,
 ) -> tuple[list[int], int, int]:
     """Concurrent TCP connect scan of a single host.
 
     Returns ``(open_ports, closed_count, filtered_count)``. Open sockets are
-    reported live via ``progress`` as they are found. The scan unwinds promptly
-    when ``stop_event`` is set, cancelling any not-yet-started probes so a
-    Ctrl+C does not block on a huge backlog of queued work.
+    reported live via ``progress`` as they are found, and ``on_open`` (if
+    given) is invoked with each open port the instant it is discovered -- this
+    lets the caller pipeline service identification while the rest of the port
+    range is still being scanned. The scan unwinds promptly when ``stop_event``
+    is set, cancelling any not-yet-started probes so a Ctrl+C does not block on
+    a huge backlog of queued work.
     """
     open_ports: list[int] = []
     closed = 0
@@ -416,7 +422,9 @@ def connect_scan_host(
             if status == OPEN:
                 open_ports.append(port)
                 if progress is not None:
-                    progress.log(f"  [+] open   {host}:{port}")
+                    progress.log(f"  [+] open   {host}:{port}  (identifying...)")
+                if on_open is not None:
+                    on_open(port)
             elif status == CLOSED:
                 closed += 1
             else:
@@ -846,6 +854,15 @@ def correlate_host_keys(results: list["HostResult"]) -> dict[str, list[str]]:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+@dataclass
+class _Assessment:
+    """Result of identifying and auditing the service behind one open port."""
+
+    port: int
+    banner: Optional[str] = None
+    audit: Optional[SSHAudit] = None
+
+
 def scan_host(
     host: str,
     ports: list[int],
@@ -859,18 +876,47 @@ def scan_host(
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
 ) -> HostResult:
-    """Scan a single host end to end: port scan then SSH validation."""
+    """Scan a single host, identifying the service behind each open port as
+    soon as it is discovered.
+
+    Port discovery and service assessment (SSH validation plus optional audit)
+    run as a pipeline on two thread pools: the moment a port is found open it
+    is handed to the assessment pool, so SSH services are confirmed while the
+    rest of the port range is still being scanned -- the user no longer waits
+    for the whole sweep to finish before learning what is SSH.
+    """
     result = HostResult(host=host)
+    result.service_checked = validate != "none"
+
+    assess_pool: Optional[ThreadPoolExecutor] = None
+    assess_futures: dict = {}
+    if result.service_checked:
+        assess_pool = ThreadPoolExecutor(max_workers=_assess_pool_size(workers))
+
+    def schedule_assessment(port: int) -> None:
+        if assess_pool is None:
+            return
+        if stop_event is not None and stop_event.is_set():
+            return
+        future = assess_pool.submit(
+            _assess_service, host, port, timeout, validate, audit,
+            stop_event, progress,
+        )
+        assess_futures[future] = port
+
     try:
         if scan_method == "syn":
             open_ports, closed, filtered = syn_scan_host(host, ports, timeout)
             if progress is not None:
-                for port in open_ports:
-                    progress.log(f"  [+] open   {host}:{port}")
                 progress.tick(len(ports), opened=len(open_ports))
+            for port in open_ports:
+                if progress is not None:
+                    progress.log(f"  [+] open   {host}:{port}  (identifying...)")
+                schedule_assessment(port)
         else:
             open_ports, closed, filtered = connect_scan_host(
-                host, ports, timeout, workers, retries, stop_event, progress
+                host, ports, timeout, workers, retries, stop_event, progress,
+                on_open=schedule_assessment,
             )
         result.open_ports = open_ports
         result.closed = closed
@@ -878,29 +924,72 @@ def scan_host(
     except Exception as exc:
         result.error = str(exc)
         LOGGER.debug("scan of %s failed: %s", host, exc)
+        if assess_pool is not None:
+            assess_pool.shutdown(wait=False)
         return result
 
-    interrupted = stop_event is not None and stop_event.is_set()
-    if result.open_ports and not interrupted:
-        banners = validate_ssh_ports(
-            host, result.open_ports, timeout, workers, validate, stop_event
-        )
-        result.banners = banners
-        result.ssh_ports = sorted(banners)
-        for port in result.ssh_ports:
-            banner = result.banners.get(port, "")
-            message = f"  [SSH] {host}:{port}" + (f"  {banner}" if banner else "")
-            if progress is not None:
-                progress.log(message)
-            else:
-                LOGGER.info("SSH on %s:%s", host, port)
-
-        if audit and not (stop_event is not None and stop_event.is_set()):
-            for port in result.ssh_ports:
-                info = audit_ssh_service(host, port, timeout)
-                result.audits[port] = info
-                _report_audit(progress, info)
+    # The assessments were already running concurrently with the port sweep;
+    # collect them now that discovery is done.
+    for future in as_completed(assess_futures):
+        if stop_event is not None and stop_event.is_set():
+            break
+        port = assess_futures[future]
+        try:
+            assessment = future.result()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.debug("assessment %s:%s failed: %s", host, port, exc)
+            continue
+        if assessment.banner:
+            result.banners[port] = assessment.banner
+            result.ssh_ports.append(port)
+        if assessment.audit is not None:
+            result.audits[port] = assessment.audit
+    result.ssh_ports.sort()
+    if assess_pool is not None:
+        for future in assess_futures:
+            future.cancel()
+        assess_pool.shutdown(wait=False)
     return result
+
+
+def _assess_pool_size(workers: int) -> int:
+    """Bound the per-host assessment pool; open ports are usually few."""
+    return max(4, min(workers, 32))
+
+
+def _assess_service(
+    host: str,
+    port: int,
+    timeout: float,
+    validate: str,
+    audit: bool,
+    stop_event: Optional[threading.Event],
+    progress: Optional[ProgressReporter],
+) -> _Assessment:
+    """Identify (and optionally audit) the service behind a single open port."""
+    assessment = _Assessment(port=port)
+    if stop_event is not None and stop_event.is_set():
+        return assessment
+
+    validator = (
+        validate_ssh_paramiko if validate == "paramiko" else grab_ssh_banner
+    )
+    banner = validator(host, port, timeout)
+    if not banner:
+        return assessment
+
+    assessment.banner = banner
+    message = f"  [SSH] {host}:{port}" + (f"  {banner}" if banner else "")
+    if progress is not None:
+        progress.log(message)
+    else:
+        LOGGER.info("SSH on %s:%s", host, port)
+
+    if audit and not (stop_event is not None and stop_event.is_set()):
+        info = audit_ssh_service(host, port, timeout)
+        assessment.audit = info
+        _report_audit(progress, info)
+    return assessment
 
 
 def _report_audit(
@@ -1067,8 +1156,16 @@ def render_text(results: list[HostResult]) -> str:
             else:
                 lines.append("  no open ports (host reachable, all closed)")
             continue
-        open_sockets = ", ".join(f"{result.host}:{p}" for p in result.open_ports)
-        lines.append(f"  open: {open_sockets}")
+        annotated = []
+        for port in result.open_ports:
+            if port in result.ssh_ports:
+                tag = "SSH"
+            elif result.service_checked:
+                tag = "not ssh"
+            else:
+                tag = "service unknown"
+            annotated.append(f"{result.host}:{port} [{tag}]")
+        lines.append(f"  open: {', '.join(annotated)}")
         if result.ssh_ports:
             for port in result.ssh_ports:
                 socket_str = f"{result.host}:{port}"
