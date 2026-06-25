@@ -1,5 +1,7 @@
 # sshfinder
 
+[![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
+
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
 which of them actually speak SSH — running both stages concurrently for
@@ -18,9 +20,13 @@ speed.
   (RFC 4253) by default, with optional full Paramiko handshake validation.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
-- **Live progress & responsive Ctrl+C** — a real-time progress indicator
-  shows the scan is working, and interrupting cancels queued work and exits
-  promptly with partial results.
+- **Live, per-socket discovery** — open ports and confirmed SSH services are
+  printed the moment they are found, as `host:port`, so it is always clear
+  which result belongs to which target when scanning many hosts.
+- **Live progress & robust Ctrl+C** — a real-time progress indicator shows the
+  scan is working. Ctrl+C is honoured even on Windows (where an unbounded
+  thread wait normally swallows it): the first press stops gracefully and
+  returns partial results, a second forces an immediate exit.
 - **Clear host status** — distinguishes open, closed, and *filtered* ports,
   so a firewalled or unreachable host is reported as such instead of looking
   like a hang.
