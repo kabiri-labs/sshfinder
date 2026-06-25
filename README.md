@@ -18,6 +18,12 @@ speed.
   - `syn` — half-open SYN scan via Scapy (faster, requires root).
 - **Reliable SSH validation** — reads the SSH identification banner
   (RFC 4253) by default, with optional full Paramiko handshake validation.
+- **SSH security audit (`--audit`)** — turns discovery into attack-surface
+  intelligence for pentesters: enumerates accepted authentication methods
+  (flagging password auth), lists offered KEX/cipher/MAC/host-key algorithms
+  and flags weak/deprecated ones, detects **Terrapin (CVE-2023-48795)**, and
+  **correlates shared host keys** across targets to reveal cloned or
+  load-balanced infrastructure.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
 - **Live, per-socket discovery** — open ports and confirmed SSH services are
@@ -60,6 +66,7 @@ python sshfinder.py [targets ...] [options]
 | `-p, --ports SPEC` | Ports to scan, e.g. `22,80,1000-2000` (default: `1-65535`). |
 | `--scan-method {auto,connect,syn}` | Scan back-end (default: `auto`). |
 | `--validate {banner,paramiko,none}` | SSH validation strategy (default: `banner`). |
+| `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, shared-key correlation). |
 | `-t, --timeout SECONDS` | Per-connection timeout (default: `2.0`). |
 | `-w, --workers N` | Concurrent probes per host (default: `200`). |
 | `--host-concurrency N` | Hosts scanned in parallel (default: `16`). |
@@ -104,6 +111,33 @@ Strictly validate SSH with a full handshake:
 ```bash
 python sshfinder.py example.com -p 22 --validate paramiko
 ```
+
+Audit the SSH attack surface across a subnet (auth methods, weak crypto,
+Terrapin, shared host keys):
+
+```bash
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --audit
+```
+
+Example audit output:
+
+```
+=== 10.0.0.5 ===
+  open: 10.0.0.5:22
+  SSH  10.0.0.5:22  (SSH-2.0-OpenSSH_7.4)
+       host key: ssh-ed25519 SHA256:T/ZM4jOL4amTsO5K3AaCdg2...
+       auth: publickey, password  [!] password auth enabled
+       [!] Terrapin (CVE-2023-48795): VULNERABLE
+       [!] weak ciphers: aes128-cbc
+
+Shared SSH host keys (possible shared/cloned hosts):
+  SHA256:T/ZM4jOL4amTsO5K3AaCdg2...
+    -> 10.0.0.5:22, 10.0.0.9:22
+```
+
+The algorithm inventory, weak-crypto flags and Terrapin check work with no
+dependencies. Host key fingerprints, auth-method enumeration and shared-key
+correlation use Paramiko (`pip install paramiko`).
 
 ## Development
 
