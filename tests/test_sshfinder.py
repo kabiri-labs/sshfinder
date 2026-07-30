@@ -2174,6 +2174,368 @@ class OutputFormatCLITests(unittest.TestCase):
             self.assertEqual(json.load(handle)["version"], "2.1.0")
 
 
+# --------------------------------------------------------------------------- #
+# Rate limiting
+# --------------------------------------------------------------------------- #
+class RateLimiterTests(unittest.TestCase):
+    def test_burst_is_available_immediately(self):
+        limiter = sshfinder.RateLimiter(rate=10, burst=5)
+        self.assertTrue(all(limiter.acquire() for _ in range(5)))
+        self.assertFalse(limiter.acquire())
+
+    def test_tokens_refill_over_time(self):
+        limiter = sshfinder.RateLimiter(rate=100, burst=1)
+        self.assertTrue(limiter.acquire())
+        self.assertFalse(limiter.acquire())
+        time.sleep(0.05)                       # 100/s means ~5 tokens by now.
+        self.assertTrue(limiter.acquire())
+
+    def test_wait_time_is_zero_when_a_token_is_ready(self):
+        limiter = sshfinder.RateLimiter(rate=10, burst=2)
+        self.assertEqual(limiter.wait_time(), 0.0)
+
+    def test_wait_time_reflects_the_rate(self):
+        limiter = sshfinder.RateLimiter(rate=10, burst=1)
+        limiter.acquire()
+        wait = limiter.wait_time()
+        self.assertGreater(wait, 0.0)
+        self.assertLessEqual(wait, 0.11)       # One token at 10/s.
+
+    def test_capacity_and_rate_are_never_zero(self):
+        limiter = sshfinder.RateLimiter(rate=0, burst=0)
+        self.assertGreater(limiter.rate, 0)
+        self.assertGreaterEqual(limiter.capacity, 1.0)
+
+    def test_shared_limiter_is_configurable(self):
+        self.addCleanup(sshfinder.configure_rate_limit, None)
+        self.assertIsNone(sshfinder.configure_rate_limit(None))
+        limiter = sshfinder.configure_rate_limit(25)
+        self.assertEqual(limiter.rate, 25)
+        self.assertIs(sshfinder.shared_rate_limiter(), limiter)
+
+    def test_a_capped_sweep_takes_longer_than_an_uncapped_one(self):
+        ports = list(range(1, 61))
+        self.addCleanup(sshfinder.configure_rate_limit, None)
+
+        def elapsed(rate):
+            sshfinder.configure_rate_limit(rate)
+            start = time.monotonic()
+            sshfinder._connect_sweep(
+                "127.0.0.1", ports, timeout=1.0, max_inflight=32
+            )
+            return time.monotonic() - start
+
+        free = elapsed(None)
+        capped = elapsed(30)      # 60 ports, 30/s burst then 30/s -> ~1s.
+        self.assertGreater(capped, free)
+        self.assertGreater(capped, 0.5)
+
+    def test_a_capped_sweep_still_finds_everything(self):
+        self.addCleanup(sshfinder.configure_rate_limit, None)
+        with LoopbackServer(_serve_ssh_banner) as server:
+            sshfinder.configure_rate_limit(20)
+            outcome = sshfinder._connect_sweep(
+                "127.0.0.1", [server.port, 1], timeout=1.0, max_inflight=8
+            )
+        self.assertEqual(outcome.open_ports, [server.port])
+        self.assertEqual(outcome.probed, 2)
+
+
+# --------------------------------------------------------------------------- #
+# SOCKS5 pivot
+# --------------------------------------------------------------------------- #
+class Socks5Server:
+    """A minimal SOCKS5 proxy, so the pivot is exercised end to end."""
+
+    def __init__(self, username=None, password=None, force_reply=None):
+        self.username = username
+        self.password = password
+        self.force_reply = force_reply
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self.port = self._sock.getsockname()[1]
+        self._stop = threading.Event()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def proxy(self):
+        return sshfinder.SocksProxy(
+            "127.0.0.1", self.port, self.username, self.password
+        )
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def _accept(self):
+        self._sock.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(
+                target=self._session, args=(conn,), daemon=True
+            ).start()
+
+    def _reply(self, conn, code):
+        conn.sendall(
+            bytes([5, code, 0, 1])
+            + socket.inet_aton("0.0.0.0")
+            + struct.pack(">H", 0)
+        )
+
+    def _session(self, conn):
+        try:
+            greeting = conn.recv(2)
+            conn.recv(greeting[1])
+            if self.username:
+                conn.sendall(bytes([5, 2]))
+                conn.recv(1)
+                user = conn.recv(conn.recv(1)[0]).decode()
+                secret = conn.recv(conn.recv(1)[0]).decode()
+                ok = user == self.username and secret == (self.password or "")
+                conn.sendall(bytes([1, 0 if ok else 1]))
+                if not ok:
+                    return
+            else:
+                conn.sendall(bytes([5, 0]))
+
+            request = conn.recv(4)
+            if request[3] == 1:
+                target = socket.inet_ntoa(conn.recv(4))
+            else:
+                target = conn.recv(conn.recv(1)[0]).decode()
+            port = struct.unpack(">H", conn.recv(2))[0]
+
+            if self.force_reply is not None:
+                self._reply(conn, self.force_reply)
+                return
+            try:
+                upstream = socket.create_connection((target, port), timeout=2)
+            except ConnectionRefusedError:
+                self._reply(conn, 5)
+                return
+            except OSError:
+                self._reply(conn, 4)
+                return
+            self._reply(conn, 0)
+            self._pump(conn, upstream)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _pump(self, left, right):
+        import select as _select
+        try:
+            while True:
+                ready, _, _ = _select.select([left, right], [], [], 2)
+                if not ready:
+                    return
+                for source in ready:
+                    data = source.recv(4096)
+                    if not data:
+                        return
+                    (right if source is left else left).sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                right.close()
+            except OSError:
+                pass
+
+
+class ParseSocksTests(unittest.TestCase):
+    def test_host_and_port(self):
+        proxy = sshfinder.parse_socks("10.0.0.1:1080")
+        self.assertEqual((proxy.host, proxy.port), ("10.0.0.1", 1080))
+        self.assertIsNone(proxy.username)
+
+    def test_credentials(self):
+        proxy = sshfinder.parse_socks("alice:s3cret@10.0.0.1:1080")
+        self.assertEqual(proxy.username, "alice")
+        self.assertEqual(proxy.password, "s3cret")
+
+    def test_password_may_contain_an_at_sign(self):
+        proxy = sshfinder.parse_socks("alice:p@ss@10.0.0.1:1080")
+        self.assertEqual(proxy.host, "10.0.0.1")
+        self.assertEqual(proxy.password, "p@ss")
+
+    def test_malformed_specifications_are_rejected(self):
+        for spec in ("", "  ", "no-port", "host:", "host:abc", "host:0",
+                     "host:70000", ":1080", ":pass@host:1080"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(ValueError):
+                    sshfinder.parse_socks(spec)
+
+
+class SocksConnectTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(sshfinder.configure_proxy, None)
+
+    def test_open_target_is_tunnelled(self):
+        with Socks5Server() as proxy, LoopbackServer(_serve_ssh_banner) as ssh:
+            status, sock = sshfinder.socks_connect(
+                proxy.proxy(), "127.0.0.1", ssh.port, 2.0
+            )
+            self.assertEqual(status, sshfinder.OPEN)
+            self.assertIsNotNone(sock)
+            sock.close()
+
+    def test_refused_target_is_closed_not_filtered(self):
+        """The proxy saw a RST, so the verdict is the same as a direct scan."""
+        with Socks5Server() as proxy:
+            status, sock = sshfinder.socks_connect(
+                proxy.proxy(), "127.0.0.1", 1, 2.0
+            )
+        self.assertEqual(status, sshfinder.CLOSED)
+        self.assertIsNone(sock)
+
+    def test_unreachable_target_is_filtered(self):
+        with Socks5Server(force_reply=4) as proxy:
+            status, _ = sshfinder.socks_connect(
+                proxy.proxy(), "10.0.0.1", 22, 2.0
+            )
+        self.assertEqual(status, sshfinder.FILTERED)
+
+    def test_authentication(self):
+        with Socks5Server(username="alice", password="s3cret") as proxy:
+            with LoopbackServer(_serve_ssh_banner) as ssh:
+                status, sock = sshfinder.socks_connect(
+                    proxy.proxy(), "127.0.0.1", ssh.port, 2.0
+                )
+                self.assertEqual(status, sshfinder.OPEN)
+                sock.close()
+
+    def test_bad_credentials_raise_rather_than_report_a_verdict(self):
+        server = Socks5Server(username="alice", password="s3cret")
+        self.addCleanup(server.close)
+        wrong = sshfinder.SocksProxy("127.0.0.1", server.port, "alice", "nope")
+        with self.assertRaises(sshfinder.ProxyError):
+            sshfinder.socks_connect(wrong, "127.0.0.1", 22, 2.0)
+
+    def test_unreachable_proxy_raises_rather_than_reporting_filtered(self):
+        """A broken pivot is a scan-wide fault, never a verdict about a port."""
+        proxy = sshfinder.SocksProxy("127.0.0.1", 1)
+        with self.assertRaises(sshfinder.ProxyError) as ctx:
+            sshfinder.socks_connect(proxy, "127.0.0.1", 22, 1.0)
+        self.assertIn("cannot reach proxy", str(ctx.exception))
+
+    def test_a_non_socks_service_is_rejected(self):
+        with LoopbackServer(_serve_ssh_banner) as notaproxy:
+            proxy = sshfinder.SocksProxy("127.0.0.1", notaproxy.port)
+            with self.assertRaises(sshfinder.ProxyError):
+                sshfinder.socks_connect(proxy, "127.0.0.1", 22, 2.0)
+
+    def test_open_connection_honours_the_configured_proxy(self):
+        with Socks5Server() as proxy, LoopbackServer(_serve_ssh_banner) as ssh:
+            sshfinder.configure_proxy(proxy.proxy())
+            sock = sshfinder.open_connection("127.0.0.1", ssh.port, 2.0)
+            self.assertGreaterEqual(sock.fileno(), 0)
+            sock.close()
+
+    def test_open_connection_is_direct_without_a_proxy(self):
+        sshfinder.configure_proxy(None)
+        with LoopbackServer(_serve_ssh_banner) as ssh:
+            sock = sshfinder.open_connection("127.0.0.1", ssh.port, 2.0)
+            sock.close()
+
+
+class ProxyScanTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(sshfinder.configure_proxy, None)
+
+    def test_scan_through_a_pivot_finds_and_identifies_the_service(self):
+        with Socks5Server() as proxy, LoopbackServer(_serve_ssh_banner) as ssh:
+            sshfinder.configure_proxy(proxy.proxy())
+            result = sshfinder.scan_host(
+                "127.0.0.1", [ssh.port, 1],
+                scan_method="connect", validate="banner",
+                timeout=2.0, workers=4, retries=0,
+            )
+        self.assertEqual(result.ssh_ports, [ssh.port])
+        self.assertEqual(result.banners[ssh.port], "SSH-2.0-OpenSSH_9.0")
+        self.assertEqual(result.closed, 1)
+
+    def test_a_broken_pivot_is_reported_as_an_error(self):
+        sshfinder.configure_proxy(sshfinder.SocksProxy("127.0.0.1", 1))
+        result = sshfinder.scan_host(
+            "127.0.0.1", [22], scan_method="connect", validate="banner",
+            timeout=1.0, workers=4, retries=0,
+        )
+        self.assertIsNotNone(result.error)
+        self.assertIn("proxy", result.error)
+        self.assertEqual(result.ssh_ports, [])
+
+
+class RateAndProxyCLITests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(sshfinder.configure_proxy, None)
+        self.addCleanup(sshfinder.configure_rate_limit, None)
+
+    def test_defaults(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertEqual(args.max_rate, 0.0)
+        self.assertIsNone(args.socks)
+
+    def test_flags_parse(self):
+        args = sshfinder.build_parser().parse_args(
+            ["10.0.0.1", "--max-rate", "50", "--socks", "u:p@10.0.0.2:1080"]
+        )
+        self.assertEqual(args.max_rate, 50)
+        self.assertEqual(args.socks, "u:p@10.0.0.2:1080")
+
+    def test_negative_rate_is_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["10.0.0.1", "--max-rate", "-1"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_malformed_proxy_is_rejected_before_scanning(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["10.0.0.1", "-p", "22", "--socks", "nonsense"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_socks_with_a_syn_scan_is_rejected(self):
+        """SOCKS5 carries TCP streams; a half-open scan has none to carry."""
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["10.0.0.1", "-p", "22", "--socks",
+                               "127.0.0.1:1080", "--scan-method", "syn"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_end_to_end_through_a_proxy(self):
+        with Socks5Server() as proxy, LoopbackServer(_serve_ssh_banner) as ssh:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = sshfinder.run([
+                    "127.0.0.1", "-p", str(ssh.port), "-q",
+                    "--socks", f"127.0.0.1:{proxy.port}", "--json",
+                ])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())[0]["ssh_ports"],
+                         [ssh.port])
+
+
 class LoggingTests(unittest.TestCase):
     """A failed Paramiko handshake is an audit finding, not a stack trace."""
 

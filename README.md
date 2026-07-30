@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.10.0-blue)
+![version](https://img.shields.io/badge/version-2.11.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -73,6 +73,14 @@ speed.
   services and ports appearing or disappearing. Only hosts present in *both*
   scans are compared, and a field neither scan measured is never reported as
   a change, so scanning one rack does not decommission every other one.
+- **Rate limiting (`--max-rate`)** — concurrency bounds how many connections
+  are open at once; this bounds how fast new ones start. A scan of production
+  has to be able to promise a ceiling on the traffic it generates, which is
+  what makes it acceptable to run under rules of engagement at all.
+- **Scan through a jump host (`--socks`)** — reach a segmented network via a
+  SOCKS5 proxy, with optional credentials. Discovery, the banner exchange and
+  the audit all go through it, so results are never half-pivoted. A proxy
+  that is unreachable is reported as a scan error, never as "no SSH found".
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
 - **Bounded by design** — a process-wide socket budget derived from the
@@ -153,6 +161,8 @@ python sshfinder.py [targets ...] [options]
 | `--no-adaptive-timeout` | Wait the full `--timeout` on every probe instead of adapting to the measured round-trip time. |
 | `-w, --workers N` | Connections in flight per host (default: `512`). |
 | `--max-sockets N` | Ceiling on probe sockets open at once across the whole scan (default: derived from the file-descriptor limit). |
+| `--max-rate N` | Cap probes per second across the whole scan (default: no cap). |
+| `--socks [user:pass@]host:port` | Reach every target through a SOCKS5 proxy. |
 | `--host-concurrency N` | Hosts scanned in parallel (default: `16`). |
 | `-r, --retries N` | Retries for timed-out probes (default: `0`). |
 | `--max-targets N` | Refuse target lists larger than this (default: `65536`). |
