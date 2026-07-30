@@ -50,7 +50,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.9.0"
+__version__ = "2.10.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -120,6 +120,20 @@ WEAK_HOST_KEYS = {
     "ssh-rsa-cert-v01@openssh.com",
     "ssh-dss-cert-v01@openssh.com",
 }
+
+# Algorithm severity. These describe how bad an algorithm is in itself, which
+# is a different question from how a policy chooses to treat it -- hence a
+# separate vocabulary from the policy engine's fail/warn.
+ALGORITHM_CRITICAL = "critical"
+ALGORITHM_WEAK = "weak"
+
+# Names that appear in a key exchange list but are not key exchange methods:
+# extension-negotiation and strict-KEX indicators. Assessing them as
+# algorithms would flag a server for advertising a countermeasure.
+KEX_PSEUDO_ALGORITHMS = frozenset({
+    "ext-info-c", "ext-info-s",
+    "kex-strict-c-v00@openssh.com", "kex-strict-s-v00@openssh.com",
+})
 
 # Post-quantum key exchange readiness.
 #
@@ -219,6 +233,7 @@ class SSHAudit:
     ciphers: list[str] = field(default_factory=list)
     macs: list[str] = field(default_factory=list)
     weaknesses: list[str] = field(default_factory=list)
+    weakness_reasons: list[str] = field(default_factory=list)
     terrapin_vulnerable: Optional[bool] = None
     pq_status: str = PQ_UNKNOWN
     pq_kex: list[str] = field(default_factory=list)
@@ -244,6 +259,7 @@ class SSHAudit:
             "ciphers": self.ciphers,
             "macs": self.macs,
             "weaknesses": self.weaknesses,
+            "weakness_reasons": self.weakness_reasons,
             "terrapin_vulnerable": self.terrapin_vulnerable,
             "pq_status": self.pq_status,
             "pq_kex": self.pq_kex,
@@ -1506,6 +1522,7 @@ def audit_ssh_service(
         audit.ciphers = _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", []))
         audit.macs = _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))
         audit.weaknesses = assess_weaknesses(kex)
+        audit.weakness_reasons = explain_weaknesses(kex)
         audit.terrapin_vulnerable = is_terrapin_vulnerable(kex)
         audit.pq_status, audit.pq_kex = assess_post_quantum(kex)
 
@@ -1653,49 +1670,205 @@ def assess_post_quantum(kex: Optional[dict]) -> tuple:
     return PQ_LEGACY, candidates
 
 
+# --------------------------------------------------------------------------- #
+# Algorithm assessment
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class AlgorithmFinding:
+    """Why one algorithm is flagged, and how badly."""
+
+    severity: str
+    reason: str
+
+
+# Exact names, checked first. Anything here is a considered judgement rather
+# than a pattern match, so the reason can say what is actually wrong with it.
+# The tool's verdicts -- the policy gate and the baseline comparison -- are
+# only as trustworthy as this table, which is why it is data rather than a
+# chain of string tests.
+ALGORITHM_TABLE = {
+    # -- Key exchange ----------------------------------------------------- #
+    "diffie-hellman-group1-sha1": AlgorithmFinding(
+        ALGORITHM_CRITICAL,
+        "1024-bit MODP group; precomputation against it is within reach of a "
+        "well-resourced attacker (Logjam)",
+    ),
+    "gss-group1-sha1-toWM5Slw5Ew8Mqkay+al2g==": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "GSS variant of the 1024-bit MODP group",
+    ),
+    "rsa1024-sha1": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "1024-bit RSA transport key with a SHA-1 hash",
+    ),
+    # -- Ciphers ---------------------------------------------------------- #
+    "none": AlgorithmFinding(ALGORITHM_CRITICAL, "no encryption at all"),
+    "arcfour": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "RC4 keystream biases allow plaintext recovery",
+    ),
+    "arcfour128": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "RC4 keystream biases allow plaintext recovery",
+    ),
+    "arcfour256": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "RC4 keystream biases allow plaintext recovery",
+    ),
+    "des-cbc": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "56-bit key, brute forceable",
+    ),
+    "3des-cbc": AlgorithmFinding(
+        ALGORITHM_CRITICAL,
+        "64-bit block size invites collisions on long sessions (Sweet32)",
+    ),
+    "blowfish-cbc": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "64-bit block size (Sweet32)",
+    ),
+    "cast128-cbc": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "64-bit block size (Sweet32)",
+    ),
+    # -- MACs ------------------------------------------------------------- #
+    "hmac-md5": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "MD5 is broken for collision resistance",
+    ),
+    "hmac-md5-96": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "MD5, truncated to 96 bits",
+    ),
+    "umac-64": AlgorithmFinding(
+        ALGORITHM_WEAK, "64-bit authentication tag is too short",
+    ),
+    "hmac-ripemd160": AlgorithmFinding(
+        ALGORITHM_WEAK, "RIPEMD-160 is deprecated and no longer analysed",
+    ),
+    # -- Host keys -------------------------------------------------------- #
+    "ssh-dss": AlgorithmFinding(
+        ALGORITHM_CRITICAL,
+        "DSA is fixed at 1024 bits and fails catastrophically on nonce reuse",
+    ),
+    "ssh-dss-cert-v01@openssh.com": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "certificate form of 1024-bit DSA",
+    ),
+    "ssh-rsa": AlgorithmFinding(
+        ALGORITHM_WEAK, "RSA with a SHA-1 signature; prefer rsa-sha2-256/512",
+    ),
+    "ssh-rsa-cert-v01@openssh.com": AlgorithmFinding(
+        ALGORITHM_WEAK, "certificate form of SHA-1 signed RSA",
+    ),
+    "x509v3-sign-rsa": AlgorithmFinding(
+        ALGORITHM_WEAK, "legacy X.509 host key with a SHA-1 signature",
+    ),
+    "x509v3-sign-dss": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "legacy X.509 host key over 1024-bit DSA",
+    ),
+    "x509v3-ssh-rsa": AlgorithmFinding(
+        ALGORITHM_WEAK, "legacy X.509 host key with a SHA-1 signature",
+    ),
+    "x509v3-ssh-dss": AlgorithmFinding(
+        ALGORITHM_CRITICAL, "legacy X.509 host key over 1024-bit DSA",
+    ),
+}
+
+# Families too large to enumerate, matched against the normalised name so a
+# vendor suffix cannot smuggle an algorithm past the check. Order matters:
+# the first match wins, so put the more specific rule first.
+ALGORITHM_PATTERNS = (
+    (lambda name: name.endswith("-cbc"), AlgorithmFinding(
+        ALGORITHM_WEAK,
+        "CBC mode is vulnerable to the SSH plaintext-recovery attack "
+        "(CVE-2008-5161) and, with Encrypt-then-MAC, to Terrapin",
+    )),
+    (lambda name: "md5" in name, AlgorithmFinding(
+        ALGORITHM_CRITICAL, "MD5 is broken for collision resistance",
+    )),
+    (lambda name: "ripemd160" in name, AlgorithmFinding(
+        ALGORITHM_WEAK, "RIPEMD-160 is deprecated and no longer analysed",
+    )),
+    (lambda name: name.startswith("umac-64"), AlgorithmFinding(
+        ALGORITHM_WEAK, "64-bit authentication tag is too short",
+    )),
+    (lambda name: name.endswith("-96"), AlgorithmFinding(
+        ALGORITHM_WEAK, "authentication tag truncated to 96 bits",
+    )),
+    (lambda name: "sha1" in name, AlgorithmFinding(
+        ALGORITHM_WEAK,
+        "SHA-1 is broken for collision resistance and deprecated for "
+        "signatures",
+    )),
+)
+
+
+def normalise_algorithm(name: str) -> str:
+    """Strip the parts of a name that do not change what it is.
+
+    A vendor suffix and the Encrypt-then-MAC marker say where an algorithm
+    comes from and how it is composed, not how strong it is. Matching without
+    removing them is how ``rijndael-cbc@lysator.liu.se`` slipped past a check
+    for names ending in ``-cbc``.
+    """
+    base = name.split("@", 1)[0].strip().lower()
+    if base.endswith("-etm"):
+        base = base[:-len("-etm")]
+    return base
+
+
+def assess_algorithm(name: str) -> Optional[AlgorithmFinding]:
+    """Judge one algorithm, or return None if nothing is wrong with it."""
+    if not name or name in KEX_PSEUDO_ALGORITHMS:
+        return None
+    finding = ALGORITHM_TABLE.get(name)
+    if finding is not None:
+        return finding
+    base = normalise_algorithm(name)
+    if base in KEX_PSEUDO_ALGORITHMS:
+        return None
+    finding = ALGORITHM_TABLE.get(base)
+    if finding is not None:
+        return finding
+    for matches, verdict in ALGORITHM_PATTERNS:
+        if matches(base):
+            return verdict
+    return None
+
+
 def assess_weaknesses(kex: dict) -> list[str]:
-    """Return human-readable findings for deprecated/weak algorithms offered."""
+    """Return human-readable findings for deprecated/weak algorithms offered.
+
+    The wording is deliberately stable across versions: these strings are
+    stored in ``--json`` reports and compared by ``--baseline``, so rephrasing
+    them would make every service look like its crypto had changed.
+    """
     findings: list[str] = []
-    weak_kex = [k for k in kex.get("kex", []) if _is_weak_kex(k)]
-    weak_hostkey = [k for k in kex.get("server_host_key", []) if k in WEAK_HOST_KEYS]
-    ciphers = _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", []))
-    weak_ciphers = [c for c in ciphers if _is_weak_cipher(c)]
-    macs = _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))
-    weak_macs = [m for m in macs if _is_weak_mac(m)]
-    if weak_kex:
-        findings.append("weak key exchange: " + ", ".join(weak_kex))
-    if weak_hostkey:
-        findings.append("weak host key alg: " + ", ".join(weak_hostkey))
-    if weak_ciphers:
-        findings.append("weak ciphers: " + ", ".join(weak_ciphers))
-    if weak_macs:
-        findings.append("weak MACs: " + ", ".join(weak_macs))
+    groups = (
+        ("weak key exchange", kex.get("kex", [])),
+        ("weak host key alg", kex.get("server_host_key", [])),
+        ("weak ciphers",
+         _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", []))),
+        ("weak MACs", _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))),
+    )
+    for label, offered in groups:
+        flagged = [name for name in offered if assess_algorithm(name)]
+        if flagged:
+            findings.append(f"{label}: " + ", ".join(flagged))
     return findings
 
 
-def _is_weak_kex(name: str) -> bool:
-    return "sha1" in name or name.startswith("diffie-hellman-group1-")
+def explain_weaknesses(kex: dict) -> list[str]:
+    """One line per flagged algorithm, saying what is wrong with it.
 
-
-def _is_weak_cipher(name: str) -> bool:
-    return (
-        name == "none"
-        or name.endswith("-cbc")
-        or name.startswith("arcfour")
-        or name.startswith("des")
-        or name.startswith("blowfish")
-        or name.startswith("cast128")
-    )
-
-
-def _is_weak_mac(name: str) -> bool:
-    return (
-        name == "none"
-        or "md5" in name
-        or "sha1" in name
-        or name.endswith("-96")
-        or name.startswith("umac-64")
-    )
+    Kept separate from :func:`assess_weaknesses` so the reasons can improve
+    without disturbing the stored findings a baseline compares against.
+    """
+    explained: list[str] = []
+    seen: set = set()
+    for offered in (
+        kex.get("kex", []),
+        kex.get("server_host_key", []),
+        _unique(kex.get("enc_s2c", []), kex.get("enc_c2s", [])),
+        _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", [])),
+    ):
+        for name in offered:
+            finding = assess_algorithm(name)
+            if finding is None or name in seen:
+                continue
+            seen.add(name)
+            explained.append(f"{name} [{finding.severity}]: {finding.reason}")
+    return explained
 
 
 def _unique(*lists: list[str]) -> list[str]:
@@ -2753,6 +2926,8 @@ def _render_audit(audit: Optional[SSHAudit]) -> list[str]:
         )
     for finding in audit.weaknesses:
         lines.append(f"       [!] {finding}")
+    for reason in audit.weakness_reasons:
+        lines.append(f"           {reason}")
     for note in audit.notes:
         lines.append(f"       note: {note}")
     return lines

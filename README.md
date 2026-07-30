@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.9.0-blue)
+![version](https://img.shields.io/badge/version-2.10.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -51,6 +51,14 @@ speed.
   It also separates services offering **pre-standard** hybrids (the withdrawn
   `sntrup4591761`, Kyber drafts) — these look post-quantum in an algorithm
   dump but negotiate classical crypto with every current client.
+- **Curated algorithm judgements** — every flagged key exchange, cipher, MAC
+  and host key comes from an explicit table with a severity (`critical` or
+  `weak`) and a stated reason, not a chain of substring tests. Names are
+  normalised first, so a vendor suffix cannot slip an algorithm past a check
+  — `rijndael-cbc@lysator.liu.se` is CBC no matter who ships it. Negotiation
+  markers such as `kex-strict-s-v00@openssh.com` are never assessed as
+  algorithms. This table is what the policy gate and the baseline comparison
+  ultimately rest on.
 - **Policy gate (`--policy`)** — check every SSH service against a baseline
   and **exit non-zero on violation**, so a scan can gate CI or a scheduled
   job. Ships with `baseline`, `strict` and `pq` built in, or takes a JSON
@@ -363,6 +371,7 @@ Example audit output:
        auth: publickey, password  [!] password auth enabled
        [!] Terrapin (CVE-2023-48795): VULNERABLE
        [!] weak ciphers: aes128-cbc
+           aes128-cbc [weak]: CBC mode is vulnerable to the SSH plaintext-recovery attack (CVE-2008-5161) and, with Encrypt-then-MAC, to Terrapin
 
 Shared SSH host keys (possible shared/cloned hosts):
   SHA256:T/ZM4jOL4amTsO5K3AaCdg2...
