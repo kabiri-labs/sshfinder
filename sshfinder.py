@@ -48,7 +48,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -145,6 +145,23 @@ PQ_READY = "ready"
 PQ_LEGACY = "legacy"
 PQ_ABSENT = "absent"
 PQ_UNKNOWN = "unknown"
+# Ordered weakest-first, so a policy can require "at least this good".
+PQ_RANK = {PQ_ABSENT: 0, PQ_UNKNOWN: 0, PQ_LEGACY: 1, PQ_READY: 2}
+
+# Policy severities, and the exit code a gated run returns when it fails.
+SEVERITY_WARN = "warn"
+SEVERITY_FAIL = "fail"
+SEVERITIES = (SEVERITY_WARN, SEVERITY_FAIL)
+FAIL_ON_NEVER = "never"
+EXIT_POLICY_VIOLATION = 3
+
+# Algorithm inventories a forbid/require rule may name.
+POLICY_FIELDS = {
+    "kex_algorithms",
+    "host_key_algorithms",
+    "ciphers",
+    "macs",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +190,7 @@ class SSHAudit:
     terrapin_vulnerable: Optional[bool] = None
     pq_status: str = PQ_UNKNOWN
     pq_kex: list[str] = field(default_factory=list)
+    violations: list["Violation"] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -197,6 +215,7 @@ class SSHAudit:
             "terrapin_vulnerable": self.terrapin_vulnerable,
             "pq_status": self.pq_status,
             "pq_kex": self.pq_kex,
+            "violations": [v.as_dict() for v in self.violations],
             "notes": self.notes,
         }
 
@@ -1693,6 +1712,270 @@ def _audit_with_paramiko(
             pass
 
 
+# --------------------------------------------------------------------------- #
+# Policy: turning findings into a verdict
+# --------------------------------------------------------------------------- #
+@dataclass
+class Violation:
+    """One policy rule a service failed."""
+
+    check: str
+    severity: str
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {
+            "check": self.check,
+            "severity": self.severity,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class Policy:
+    """A named set of rules every SSH service is expected to satisfy."""
+
+    name: str
+    description: str = ""
+    rules: list = field(default_factory=list)
+
+    @property
+    def needs_auth_methods(self) -> bool:
+        """True if any rule inspects accepted authentication methods.
+
+        Only that one predicate needs the Paramiko handshake. A policy about
+        crypto alone therefore runs dependency-free, which is what keeps
+        ``--policy pq`` usable on a bare interpreter.
+        """
+        return any(rule["check"] == "password_auth" for rule in self.rules)
+
+
+class PolicyError(ValueError):
+    """A policy could not be loaded or is not valid."""
+
+
+# Policies shipped with the tool, so the common cases need no file. Named for
+# the outcome they enforce rather than for a distribution, because the estate
+# owner cares whether a service is acceptable, not what it runs on.
+BUILTIN_POLICIES = {
+    "baseline": {
+        "name": "baseline",
+        "description": "No password login, no Terrapin exposure, no weak "
+                       "algorithms.",
+        "rules": [
+            {"check": "password_auth", "severity": SEVERITY_FAIL},
+            {"check": "terrapin", "severity": SEVERITY_FAIL},
+            {"check": "weak_algorithms", "severity": SEVERITY_FAIL},
+            {"check": "post_quantum", "require": PQ_READY,
+             "severity": SEVERITY_WARN},
+        ],
+    },
+    "strict": {
+        "name": "strict",
+        "description": "Baseline, plus post-quantum key exchange and modern "
+                       "host keys required.",
+        "rules": [
+            {"check": "password_auth", "severity": SEVERITY_FAIL},
+            {"check": "terrapin", "severity": SEVERITY_FAIL},
+            {"check": "weak_algorithms", "severity": SEVERITY_FAIL},
+            {"check": "post_quantum", "require": PQ_READY,
+             "severity": SEVERITY_FAIL},
+            {"check": "forbid", "field": "host_key_algorithms",
+             "algorithms": sorted(WEAK_HOST_KEYS), "severity": SEVERITY_FAIL},
+        ],
+    },
+    "pq": {
+        "name": "pq",
+        "description": "Post-quantum key exchange required; needs no "
+                       "third-party library.",
+        "rules": [
+            {"check": "post_quantum", "require": PQ_READY,
+             "severity": SEVERITY_FAIL},
+        ],
+    },
+}
+
+_POLICY_CHECKS = frozenset({
+    "password_auth", "terrapin", "weak_algorithms", "post_quantum",
+    "forbid", "require",
+})
+
+
+def load_policy(source: str) -> Policy:
+    """Load a built-in policy by name, or a policy document from a path.
+
+    Every field is validated up front and anything unrecognised is an error.
+    A security gate that silently skips a rule it does not understand is worse
+    than no gate at all: a typo would quietly turn a failing estate green.
+
+    Raises:
+        PolicyError: if the policy is unknown, unreadable, or malformed.
+    """
+    if source in BUILTIN_POLICIES:
+        document = BUILTIN_POLICIES[source]
+    else:
+        try:
+            with open(source, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except OSError as exc:
+            known = ", ".join(sorted(BUILTIN_POLICIES))
+            raise PolicyError(
+                f"cannot read policy {source!r}: {exc} "
+                f"(built-in policies: {known})"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise PolicyError(f"policy {source!r} is not valid JSON: {exc}")
+
+    if not isinstance(document, dict):
+        raise PolicyError(f"policy {source!r} must be a JSON object")
+    rules = document.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise PolicyError(f"policy {source!r} defines no rules")
+    return Policy(
+        name=str(document.get("name") or source),
+        description=str(document.get("description", "")),
+        rules=[_validate_rule(index, rule) for index, rule in enumerate(rules)],
+    )
+
+
+def _validate_rule(index: int, rule) -> dict:
+    """Check one rule, rejecting anything this version cannot enforce."""
+    where = f"rule {index + 1}"
+    if not isinstance(rule, dict):
+        raise PolicyError(f"{where} must be an object")
+    check = rule.get("check")
+    if check not in _POLICY_CHECKS:
+        known = ", ".join(sorted(_POLICY_CHECKS))
+        raise PolicyError(f"{where}: unknown check {check!r} (known: {known})")
+    severity = rule.get("severity", SEVERITY_FAIL)
+    if severity not in SEVERITIES:
+        raise PolicyError(
+            f"{where}: severity must be one of {', '.join(SEVERITIES)}"
+        )
+    validated = {"check": check, "severity": severity}
+
+    if check == "post_quantum":
+        required = rule.get("require", PQ_READY)
+        if required not in PQ_RANK:
+            known = ", ".join(sorted(PQ_RANK))
+            raise PolicyError(
+                f"{where}: require must be one of {known}, not {required!r}"
+            )
+        validated["require"] = required
+    elif check in ("forbid", "require"):
+        field_name = rule.get("field")
+        if field_name not in POLICY_FIELDS:
+            known = ", ".join(sorted(POLICY_FIELDS))
+            raise PolicyError(
+                f"{where}: field must be one of {known}, not {field_name!r}"
+            )
+        algorithms = rule.get("algorithms")
+        if not isinstance(algorithms, list) or not algorithms:
+            raise PolicyError(f"{where}: algorithms must be a non-empty list")
+        if not all(isinstance(name, str) for name in algorithms):
+            raise PolicyError(f"{where}: algorithms must all be strings")
+        validated["field"] = field_name
+        validated["algorithms"] = list(algorithms)
+    return validated
+
+
+def evaluate_policy(policy: Policy, audit: SSHAudit) -> list:
+    """Return the violations one service commits against ``policy``."""
+    violations: list = []
+    for rule in policy.rules:
+        violation = _apply_rule(rule, audit)
+        if violation is not None:
+            violations.append(violation)
+    return violations
+
+
+def _apply_rule(rule: dict, audit: SSHAudit) -> Optional[Violation]:
+    check = rule["check"]
+    severity = rule["severity"]
+
+    if check == "password_auth":
+        if audit.password_auth:
+            return Violation(
+                check, severity,
+                "password login accepted: " + ", ".join(audit.auth_methods),
+            )
+        return None
+
+    if check == "terrapin":
+        if audit.terrapin_vulnerable:
+            return Violation(
+                check, severity, "vulnerable to Terrapin (CVE-2023-48795)"
+            )
+        return None
+
+    if check == "weak_algorithms":
+        if audit.weaknesses:
+            return Violation(check, severity, "; ".join(audit.weaknesses))
+        return None
+
+    if check == "post_quantum":
+        required = rule["require"]
+        if PQ_RANK.get(audit.pq_status, 0) < PQ_RANK[required]:
+            return Violation(
+                check, severity,
+                f"post-quantum readiness is {audit.pq_status}, "
+                f"{required} required",
+            )
+        return None
+
+    offered = getattr(audit, rule["field"], [])
+    named = set(rule["algorithms"])
+    if check == "forbid":
+        present = [name for name in offered if name in named]
+        if present:
+            return Violation(
+                check, severity,
+                f"{rule['field']} offers forbidden {', '.join(present)}",
+            )
+        return None
+
+    # check == "require"
+    missing = [name for name in rule["algorithms"] if name not in offered]
+    if missing:
+        return Violation(
+            check, severity,
+            f"{rule['field']} is missing required {', '.join(missing)}",
+        )
+    return None
+
+
+def apply_policy(policy: Policy, results: list["HostResult"]) -> dict:
+    """Evaluate every audited service and record the violations on it.
+
+    Returns ``{severity: [socket, ...]}`` for the services that violated at
+    that severity, which is what the summary and the exit code are built from.
+    """
+    offenders: dict = defaultdict(list)
+    for result in results:
+        for port in sorted(result.audits):
+            audit = result.audits[port]
+            audit.violations = evaluate_policy(policy, audit)
+            if not audit.violations:
+                continue
+            worst = (
+                SEVERITY_FAIL
+                if any(v.severity == SEVERITY_FAIL for v in audit.violations)
+                else SEVERITY_WARN
+            )
+            offenders[worst].append(f"{result.host}:{port}")
+    return dict(offenders)
+
+
+def policy_exit_code(offenders: dict, fail_on: str) -> int:
+    """Translate policy offenders into a process exit code."""
+    if fail_on == FAIL_ON_NEVER:
+        return 0
+    gated = list(offenders.get(SEVERITY_FAIL, []))
+    if fail_on == SEVERITY_WARN:
+        gated += offenders.get(SEVERITY_WARN, [])
+    return EXIT_POLICY_VIOLATION if gated else 0
+
+
 def correlate_host_keys(results: list["HostResult"]) -> dict[str, list[str]]:
     """Group sockets by shared SSH host-key fingerprint.
 
@@ -2155,6 +2438,11 @@ def _render_audit(audit: Optional[SSHAudit]) -> list[str]:
     if audit.terrapin_vulnerable:
         lines.append("       [!] Terrapin (CVE-2023-48795): VULNERABLE")
     lines.extend(_render_pq(audit))
+    for violation in audit.violations:
+        marker = "FAIL" if violation.severity == SEVERITY_FAIL else "warn"
+        lines.append(
+            f"       [{marker}] policy/{violation.check}: {violation.detail}"
+        )
     for finding in audit.weaknesses:
         lines.append(f"       [!] {finding}")
     for note in audit.notes:
@@ -2233,6 +2521,44 @@ def render_pq_report(results: list[HostResult]) -> str:
     return "\n".join(lines)
 
 
+def render_policy_report(
+    policy: Policy, offenders: dict, results: list[HostResult]
+) -> str:
+    """Render the estate-level policy verdict."""
+    audited = sum(len(result.audits) for result in results)
+    failed = offenders.get(SEVERITY_FAIL, [])
+    warned = offenders.get(SEVERITY_WARN, [])
+    lines = [f"Policy '{policy.name}':"]
+    if policy.description:
+        lines.append(f"  {policy.description}")
+    if not audited:
+        lines.append("  no SSH services were audited")
+        return "\n".join(lines)
+
+    passed = audited - len(failed) - len(warned)
+    lines.append(f"  {passed}/{audited} service(s) pass")
+
+    audits = {
+        f"{result.host}:{port}": audit
+        for result in results
+        for port, audit in sorted(result.audits.items())
+    }
+    for sockets, label in ((failed, "FAIL"), (warned, "warn")):
+        if not sockets:
+            continue
+        lines.append(f"  [{label}] {len(sockets)} service(s):")
+        for socket_str in sockets:
+            lines.append(f"        {socket_str}")
+            # Every violation, not just the ones at the bucket's severity: a
+            # service listed under FAIL still needs its warnings fixed too.
+            for violation in audits[socket_str].violations:
+                mark = "" if violation.severity == SEVERITY_FAIL else " (warn)"
+                lines.append(
+                    f"          - {violation.check}{mark}: {violation.detail}"
+                )
+    return "\n".join(lines)
+
+
 def render_json(results: list[HostResult]) -> str:
     return json.dumps([r.as_dict() for r in results], indent=2)
 
@@ -2280,6 +2606,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit each SSH service: algorithms, host key, auth methods, "
         "Terrapin (CVE-2023-48795), post-quantum readiness and "
         "shared-host-key correlation.",
+    )
+    parser.add_argument(
+        "--policy",
+        help="Check every SSH service against a policy and exit non-zero on "
+        "violation. Takes a built-in name (" + ", ".join(
+            sorted(BUILTIN_POLICIES)
+        ) + ") or a path to a JSON policy document.",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=(SEVERITY_FAIL, SEVERITY_WARN, FAIL_ON_NEVER),
+        default=SEVERITY_FAIL,
+        help="Which policy severity gates the exit code "
+        f"(default: {SEVERITY_FAIL}).",
     )
     parser.add_argument(
         "--pq-report",
@@ -2449,11 +2789,21 @@ def run(argv: Optional[list[str]] = None) -> int:
     if args.scan_method == "syn" and not _scapy_available():
         parser.error("syn scan requires the optional 'scapy' dependency")
 
-    # --pq-report needs the KEXINIT but not the Paramiko handshake, so it runs
-    # the audit shallow: dependency-free, and one connection per service
-    # instead of two.
-    audit = args.audit or args.pq_report
-    audit_deep = args.audit
+    policy = None
+    if args.policy:
+        try:
+            policy = load_policy(args.policy)
+        except PolicyError as exc:
+            parser.error(str(exc))
+
+    # --pq-report and --policy need the KEXINIT but not necessarily the
+    # Paramiko handshake, so they run the audit shallow where they can:
+    # dependency-free, and one connection per service instead of two. Only a
+    # policy that inspects authentication methods pays for the deep probe.
+    audit = args.audit or args.pq_report or policy is not None
+    audit_deep = args.audit or (
+        policy is not None and policy.needs_auth_methods
+    )
     validate = args.validate
     if audit and validate == "none":
         # Auditing needs confirmed SSH services to act on.
@@ -2506,14 +2856,25 @@ def run(argv: Optional[list[str]] = None) -> int:
     finally:
         reporter.finish()
 
+    # Evaluate before rendering, so the violations reach the report and the
+    # JSON alike.
+    offenders: dict = {}
+    if policy is not None:
+        offenders = apply_policy(policy, results)
+
     if args.json:
         output = render_json(results)
+    elif policy is not None and not args.audit:
+        # Asked for a verdict, so lead with the verdict.
+        output = render_policy_report(policy, offenders, results)
     elif args.pq_report and not args.audit:
         # Asked only for the readiness picture, so give exactly that: a full
         # per-host listing across an estate would bury it.
         output = render_pq_report(results)
     else:
         output = render_text(results)
+        if policy is not None:
+            output += "\n\n" + render_policy_report(policy, offenders, results)
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as handle:
@@ -2527,9 +2888,13 @@ def run(argv: Optional[list[str]] = None) -> int:
         # a trailing report would corrupt the JSONL on stdout.
         print(output)
 
-    # Exit non-zero only on hard errors, not on "nothing found".
+    # A hard error outranks a policy verdict: if nothing was reachable, the
+    # scan proved nothing about compliance either way.
     if results and all(r.error for r in results):
         return 1
+    if policy is not None:
+        return policy_exit_code(offenders, args.fail_on)
+    # Otherwise exit non-zero only on hard errors, not on "nothing found".
     return 0
 
 
