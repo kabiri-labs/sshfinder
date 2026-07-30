@@ -30,4 +30,4 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest -q
+        run: python -m unittest discover -s tests -v

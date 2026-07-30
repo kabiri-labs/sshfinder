@@ -1,6 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
+![version](https://img.shields.io/badge/version-2.3.1-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -155,9 +156,18 @@ correlation use Paramiko (`pip install paramiko`).
 
 ## Development
 
+The test suite is standard-library only, so it runs on a bare interpreter:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Install the runtime dependencies to also exercise the Paramiko-backed audit
+tests, which skip themselves when Paramiko is missing:
+
 ```bash
 pip install -r requirements-dev.txt
-pytest
+python -m unittest discover -s tests
 ```
 
 ## Legal
