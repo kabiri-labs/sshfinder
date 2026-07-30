@@ -48,7 +48,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -154,6 +154,17 @@ SEVERITY_FAIL = "fail"
 SEVERITIES = (SEVERITY_WARN, SEVERITY_FAIL)
 FAIL_ON_NEVER = "never"
 EXIT_POLICY_VIOLATION = 3
+EXIT_BASELINE_DRIFT = 4
+
+# How a change since the baseline should be triaged.
+DRIFT_ALERT = "alert"        # Posture got worse, or a key moved under us.
+DRIFT_ADDED = "added"        # Attack surface grew.
+DRIFT_REMOVED = "removed"    # Something we used to see is gone.
+DRIFT_IMPROVED = "improved"  # Posture got better; worth showing fixes land.
+DRIFT_INFO = "info"          # Changed, but neither better nor worse.
+DRIFT_CATEGORIES = (
+    DRIFT_ALERT, DRIFT_ADDED, DRIFT_REMOVED, DRIFT_IMPROVED, DRIFT_INFO,
+)
 
 # Algorithm inventories a forbid/require rule may name.
 POLICY_FIELDS = {
@@ -1976,6 +1987,282 @@ def policy_exit_code(offenders: dict, fail_on: str) -> int:
     return EXIT_POLICY_VIOLATION if gated else 0
 
 
+# --------------------------------------------------------------------------- #
+# Baseline: what changed since last time
+# --------------------------------------------------------------------------- #
+@dataclass
+class Change:
+    """One difference between a previous scan and this one."""
+
+    kind: str
+    category: str
+    target: str
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "category": self.category,
+            "target": self.target,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class Baseline:
+    """A previous scan, indexed for comparison.
+
+    ``hosts`` matters as much as the data: only hosts present in both scans
+    are compared. Without that, pointing the tool at one rack would report
+    every other rack as decommissioned.
+    """
+
+    source: str
+    hosts: set = field(default_factory=set)
+    services: dict = field(default_factory=dict)
+    open_ports: dict = field(default_factory=dict)
+
+    @property
+    def has_audit(self) -> bool:
+        """True if the previous scan recorded any audit detail."""
+        return any(entry["audit"] for entry in self.services.values())
+
+    @property
+    def needs_deep_audit(self) -> bool:
+        """True if the baseline knows things only the deep probe can measure.
+
+        Matching the previous scan's depth keeps the comparison honest: a
+        shallow scan against a deep baseline would read every host key as
+        having vanished.
+        """
+        return any(
+            entry["audit"].get("host_key_fingerprint")
+            or entry["audit"].get("auth_methods")
+            for entry in self.services.values()
+        )
+
+
+class BaselineError(ValueError):
+    """A baseline could not be loaded or is not valid."""
+
+
+def load_baseline(path: str) -> Baseline:
+    """Load a previous ``--json`` run for comparison.
+
+    The contract is this tool's own JSON output, so a baseline is simply an
+    earlier report. Fields absent from an older file are treated as unknown
+    rather than as a change, which lets a baseline written by an earlier
+    version still be useful.
+
+    Raises:
+        BaselineError: if the file is unreadable or is not a scan report.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except OSError as exc:
+        raise BaselineError(f"cannot read baseline {path!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise BaselineError(f"baseline {path!r} is not valid JSON: {exc}")
+
+    if not isinstance(document, list):
+        raise BaselineError(
+            f"baseline {path!r} must be a scan report from --json "
+            "(a JSON array of hosts)"
+        )
+
+    baseline = Baseline(source=path)
+    for entry in document:
+        if not isinstance(entry, dict) or "host" not in entry:
+            raise BaselineError(
+                f"baseline {path!r} contains an entry that is not a host record"
+            )
+        host = entry["host"]
+        baseline.hosts.add(host)
+        baseline.open_ports[host] = set(entry.get("open_ports") or [])
+        audits = entry.get("audit") or {}
+        banners = entry.get("banners") or {}
+        for port in entry.get("ssh_ports") or []:
+            baseline.services[f"{host}:{port}"] = {
+                "banner": banners.get(str(port), ""),
+                "audit": audits.get(str(port)) or {},
+            }
+    return baseline
+
+
+def diff_against_baseline(
+    baseline: Baseline, results: list["HostResult"]
+) -> list:
+    """Compare this scan with ``baseline`` and describe what moved."""
+    changes: list = []
+    scanned = {result.host for result in results if result.error is None}
+    comparable = scanned & baseline.hosts
+
+    current_services = {}
+    for result in results:
+        if result.error is not None:
+            continue
+        for port in sorted(result.ssh_ports):
+            current_services[f"{result.host}:{port}"] = (
+                result.banners.get(port, ""),
+                result.audits.get(port),
+            )
+        if result.host in comparable:
+            changes.extend(_diff_open_ports(baseline, result))
+
+    for socket_str, (banner, audit) in sorted(current_services.items()):
+        host = socket_str.rsplit(":", 1)[0]
+        previous = baseline.services.get(socket_str)
+        if previous is None:
+            if host in comparable:
+                changes.append(Change(
+                    "ssh_service_added", DRIFT_ADDED, socket_str,
+                    f"new SSH service{f' ({banner})' if banner else ''}",
+                ))
+            continue
+        changes.extend(_diff_service(socket_str, previous, banner, audit))
+
+    for socket_str in sorted(baseline.services):
+        host = socket_str.rsplit(":", 1)[0]
+        if host in comparable and socket_str not in current_services:
+            changes.append(Change(
+                "ssh_service_removed", DRIFT_REMOVED, socket_str,
+                "SSH service no longer answering",
+            ))
+    return changes
+
+
+def _diff_open_ports(baseline: Baseline, result: "HostResult") -> list:
+    """Report ports that opened or closed on a host seen in both scans."""
+    was = baseline.open_ports.get(result.host, set())
+    now = set(result.open_ports)
+    changes = []
+    for port in sorted(now - was):
+        changes.append(Change(
+            "port_opened", DRIFT_ADDED, f"{result.host}:{port}",
+            "port is open and was not before",
+        ))
+    for port in sorted(was - now):
+        changes.append(Change(
+            "port_closed", DRIFT_REMOVED, f"{result.host}:{port}",
+            "port was open before and is not now",
+        ))
+    return changes
+
+
+def _diff_service(
+    socket_str: str, previous: dict, banner: str, audit: Optional[SSHAudit]
+) -> list:
+    """Compare one service that exists in both scans.
+
+    Every comparison is skipped unless both sides actually measured the thing.
+    A baseline taken without ``--audit`` knows nothing about host keys, and an
+    audit without Paramiko knows nothing about authentication methods; naming
+    either as a change would manufacture alerts out of missing data.
+    """
+    changes: list = []
+    before = previous.get("audit") or {}
+    was_banner = previous.get("banner") or ""
+    if was_banner and banner and was_banner != banner:
+        changes.append(Change(
+            "banner_changed", DRIFT_INFO, socket_str,
+            f"{was_banner} -> {banner}",
+        ))
+    if audit is None:
+        return changes
+
+    old_key = before.get("host_key_fingerprint") or ""
+    if old_key and audit.host_key_fingerprint and (
+        old_key != audit.host_key_fingerprint
+    ):
+        changes.append(Change(
+            "host_key_changed", DRIFT_ALERT, socket_str,
+            f"{old_key} -> {audit.host_key_fingerprint}; expected only after "
+            "a rebuild or key rotation",
+        ))
+
+    # password_auth is derived from auth_methods, so an empty list means the
+    # probe never ran rather than "no password login". Comparing those would
+    # invent a regression every time Paramiko was missing on one side.
+    if before.get("auth_methods") and audit.auth_methods:
+        was_password = bool(before.get("password_auth"))
+        if audit.password_auth and not was_password:
+            changes.append(Change(
+                "password_auth_enabled", DRIFT_ALERT, socket_str,
+                "password login is now accepted",
+            ))
+        elif was_password and not audit.password_auth:
+            changes.append(Change(
+                "password_auth_disabled", DRIFT_IMPROVED, socket_str,
+                "password login is no longer accepted",
+            ))
+
+    was_terrapin = before.get("terrapin_vulnerable")
+    if was_terrapin is not None and audit.terrapin_vulnerable is not None:
+        if audit.terrapin_vulnerable and not was_terrapin:
+            changes.append(Change(
+                "terrapin_regression", DRIFT_ALERT, socket_str,
+                "now vulnerable to Terrapin (CVE-2023-48795)",
+            ))
+        elif was_terrapin and not audit.terrapin_vulnerable:
+            changes.append(Change(
+                "terrapin_fixed", DRIFT_IMPROVED, socket_str,
+                "no longer vulnerable to Terrapin",
+            ))
+
+    was_pq = before.get("pq_status", PQ_UNKNOWN)
+    if was_pq != PQ_UNKNOWN and audit.pq_status != PQ_UNKNOWN:
+        old_rank = PQ_RANK.get(was_pq, 0)
+        new_rank = PQ_RANK.get(audit.pq_status, 0)
+        if new_rank < old_rank:
+            changes.append(Change(
+                "post_quantum_regression", DRIFT_ALERT, socket_str,
+                f"post-quantum readiness fell from {was_pq} to "
+                f"{audit.pq_status}",
+            ))
+        elif new_rank > old_rank:
+            changes.append(Change(
+                "post_quantum_improved", DRIFT_IMPROVED, socket_str,
+                f"post-quantum readiness rose from {was_pq} to "
+                f"{audit.pq_status}",
+            ))
+
+    if "weaknesses" in before:
+        was_weak = set(before.get("weaknesses") or [])
+        now_weak = set(audit.weaknesses)
+        for finding in sorted(now_weak - was_weak):
+            changes.append(Change(
+                "weakness_added", DRIFT_ALERT, socket_str, finding
+            ))
+        for finding in sorted(was_weak - now_weak):
+            changes.append(Change(
+                "weakness_resolved", DRIFT_IMPROVED, socket_str,
+                f"resolved: {finding}",
+            ))
+    return changes
+
+
+def group_changes(changes: list) -> dict:
+    """Bucket changes by category, preserving order within each."""
+    grouped: dict = defaultdict(list)
+    for change in changes:
+        grouped[change.category].append(change)
+    return dict(grouped)
+
+
+def drift_exit_code(changes: list, fail_on_drift: bool) -> int:
+    """Translate drift into an exit code.
+
+    Only alerts gate. A new host or a decommissioned one is ordinary estate
+    churn, and failing a scheduled job on it would train everyone to ignore
+    the result.
+    """
+    if not fail_on_drift:
+        return 0
+    alerts = any(change.category == DRIFT_ALERT for change in changes)
+    return EXIT_BASELINE_DRIFT if alerts else 0
+
+
 def correlate_host_keys(results: list["HostResult"]) -> dict[str, list[str]]:
     """Group sockets by shared SSH host-key fingerprint.
 
@@ -2559,6 +2846,24 @@ def render_policy_report(
     return "\n".join(lines)
 
 
+def render_drift_report(baseline: Baseline, changes: list) -> str:
+    """Render what moved since the baseline, most urgent first."""
+    lines = [f"Baseline drift (vs {baseline.source}):"]
+    if not changes:
+        lines.append("  no changes")
+        return "\n".join(lines)
+
+    grouped = group_changes(changes)
+    for category in DRIFT_CATEGORIES:
+        bucket = grouped.get(category)
+        if not bucket:
+            continue
+        lines.append(f"  [{category}] {len(bucket)} change(s):")
+        for change in bucket:
+            lines.append(f"        {change.target}  {change.detail}")
+    return "\n".join(lines)
+
+
 def render_json(results: list[HostResult]) -> str:
     return json.dumps([r.as_dict() for r in results], indent=2)
 
@@ -2620,6 +2925,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=SEVERITY_FAIL,
         help="Which policy severity gates the exit code "
         f"(default: {SEVERITY_FAIL}).",
+    )
+    parser.add_argument(
+        "--baseline",
+        help="Compare this scan against a previous --json report and list "
+        "what changed. Only hosts present in both scans are compared.",
+    )
+    parser.add_argument(
+        "--fail-on-drift",
+        action="store_true",
+        help="Exit non-zero when the baseline comparison raises an alert "
+        "(host key change, weakened crypto, password login enabled). "
+        "Services appearing or disappearing do not gate.",
     )
     parser.add_argument(
         "--pq-report",
@@ -2742,6 +3059,14 @@ def configure_logging(verbose: int, quiet: bool) -> None:
         level=level,
         format="%(levelname)s %(message)s",
     )
+    # Paramiko logs a full traceback from its own transport thread every time
+    # a handshake fails, and across an estate most of them do -- a server that
+    # offers no algorithm Paramiko accepts is an ordinary audit finding, not an
+    # error worth ten lines of stack. We record it as a note either way, so
+    # keep the raw noise out of the report unless the user asks twice for it.
+    logging.getLogger("paramiko").setLevel(
+        logging.DEBUG if verbose >= 2 else logging.CRITICAL
+    )
 
 
 def run(argv: Optional[list[str]] = None) -> int:
@@ -2796,14 +3121,31 @@ def run(argv: Optional[list[str]] = None) -> int:
         except PolicyError as exc:
             parser.error(str(exc))
 
+    # Load before scanning, so an unreadable baseline costs no packets.
+    baseline = None
+    if args.baseline:
+        try:
+            baseline = load_baseline(args.baseline)
+        except BaselineError as exc:
+            parser.error(str(exc))
+    elif args.fail_on_drift:
+        parser.error("--fail-on-drift requires --baseline")
+
     # --pq-report and --policy need the KEXINIT but not necessarily the
     # Paramiko handshake, so they run the audit shallow where they can:
     # dependency-free, and one connection per service instead of two. Only a
     # policy that inspects authentication methods pays for the deep probe.
-    audit = args.audit or args.pq_report or policy is not None
+    # A baseline sets the depth too: comparing a shallow scan against a deep
+    # baseline would read every host key as having vanished.
+    audit = (
+        args.audit
+        or args.pq_report
+        or policy is not None
+        or (baseline is not None and baseline.has_audit)
+    )
     audit_deep = args.audit or (
         policy is not None and policy.needs_auth_methods
-    )
+    ) or (baseline is not None and baseline.needs_deep_audit)
     validate = args.validate
     if audit and validate == "none":
         # Auditing needs confirmed SSH services to act on.
@@ -2861,9 +3203,15 @@ def run(argv: Optional[list[str]] = None) -> int:
     offenders: dict = {}
     if policy is not None:
         offenders = apply_policy(policy, results)
+    changes: list = []
+    if baseline is not None:
+        changes = diff_against_baseline(baseline, results)
 
     if args.json:
         output = render_json(results)
+    elif baseline is not None and not (args.audit or policy or args.pq_report):
+        # Asked what changed, so answer that and nothing else.
+        output = render_drift_report(baseline, changes)
     elif policy is not None and not args.audit:
         # Asked for a verdict, so lead with the verdict.
         output = render_policy_report(policy, offenders, results)
@@ -2875,6 +3223,8 @@ def run(argv: Optional[list[str]] = None) -> int:
         output = render_text(results)
         if policy is not None:
             output += "\n\n" + render_policy_report(policy, offenders, results)
+        if baseline is not None:
+            output += "\n\n" + render_drift_report(baseline, changes)
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as handle:
@@ -2892,8 +3242,14 @@ def run(argv: Optional[list[str]] = None) -> int:
     # scan proved nothing about compliance either way.
     if results and all(r.error for r in results):
         return 1
+    # A policy verdict outranks drift: failing the stated bar is the more
+    # specific finding, and reporting only "something changed" would bury it.
     if policy is not None:
-        return policy_exit_code(offenders, args.fail_on)
+        code = policy_exit_code(offenders, args.fail_on)
+        if code:
+            return code
+    if baseline is not None:
+        return drift_exit_code(changes, args.fail_on_drift)
     # Otherwise exit non-zero only on hard errors, not on "nothing found".
     return 0
 

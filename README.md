@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.7.0-blue)
+![version](https://img.shields.io/badge/version-2.8.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -58,6 +58,13 @@ speed.
   decides which one gates. An unrecognised check, field or severity is a
   hard error, never a silently skipped rule — a typo must not turn a failing
   estate green.
+- **Baseline comparison (`--baseline`)** — run it nightly against yesterday's
+  `--json` report and see only what moved: a **host key that changed** (the
+  signal that matters most — expected only after a rebuild or key rotation),
+  password login newly enabled, crypto weakened, post-quantum readiness lost,
+  services and ports appearing or disappearing. Only hosts present in *both*
+  scans are compared, and a field neither scan measured is never reported as
+  a change, so scanning one rack does not decommission every other one.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
 - **Bounded by design** — a process-wide socket budget derived from the
@@ -126,6 +133,8 @@ python sshfinder.py [targets ...] [options]
 | `--pq-report` | Report post-quantum key exchange readiness across the estate. Reads only the KEXINIT — no third-party library needed. |
 | `--policy NAME_OR_PATH` | Check each SSH service against a policy (`baseline`, `strict`, `pq`, or a JSON file) and exit `3` on violation. |
 | `--fail-on {fail,warn,never}` | Which policy severity gates the exit code (default: `fail`). |
+| `--baseline FILE` | Compare against a previous `--json` report and list what changed. |
+| `--fail-on-drift` | Exit `4` when the comparison raises an alert. Services appearing or disappearing do not gate. |
 
 | `-t, --timeout SECONDS` | Longest a probe may wait (default: `2.0`). |
 | `--min-timeout SECONDS` | Floor for the adaptive probe timeout (default: `0.1`). |
@@ -151,11 +160,13 @@ python sshfinder.py [targets ...] [options]
 | `1` | Hard error: every target failed to scan, or the output file could not be written. |
 | `2` | Bad invocation (unknown flag, invalid port spec, malformed policy). |
 | `3` | Policy violation at or above `--fail-on`. Only ever returned with `--policy`. |
+| `4` | Baseline drift alert. Only ever returned with `--baseline --fail-on-drift`. |
 | `130` | Interrupted with Ctrl+C. |
 
-A hard error outranks a policy verdict: if nothing was reachable, the scan
-proved nothing about compliance either way, so you get `1` rather than a
-misleading pass or fail.
+A hard error outranks a policy verdict, and a policy verdict outranks drift:
+if nothing was reachable, the scan proved nothing about compliance either way,
+so you get `1` rather than a misleading pass or fail; and failing a stated bar
+is a more specific finding than "something changed".
 
 > **Note on slow scans.** A full `1-65535` sweep of a firewalled host still
 > has to wait out a timeout per filtered port. Four things keep that from
@@ -284,6 +295,30 @@ Available checks: `password_auth`, `terrapin`, `weak_algorithms`,
 `forbid` / `require` over a `field` of `kex_algorithms`,
 `host_key_algorithms`, `ciphers` or `macs`. Anything else is rejected when
 the policy loads.
+
+Track an estate over time — capture a report, then compare against it:
+
+```bash
+# Nightly, in cron:
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --audit --json -o today.json
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --baseline yesterday.json \
+    --fail-on-drift
+```
+
+```
+Baseline drift (vs yesterday.json):
+  [alert] 2 change(s):
+        10.0.0.5:22  SHA256:T/ZM4jO... -> SHA256:9aKm2Qx...; expected only after a rebuild or key rotation
+        10.0.0.3:22  password login is now accepted
+  [added] 1 change(s):
+        10.0.0.9:2222  new SSH service (SSH-2.0-OpenSSH_9.6)
+  [improved] 1 change(s):
+        10.0.0.7:22  post-quantum readiness rose from absent to ready
+```
+
+The comparison matches the baseline's depth automatically: a baseline holding
+host key fingerprints makes this scan run the deep probe too, so a shallow
+rescan never reads as every key having vanished.
 
 Example audit output:
 
