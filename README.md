@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.3.1-blue)
+![version](https://img.shields.io/badge/version-2.4.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -12,13 +12,25 @@ speed.
 
 - **Multiple targets** — scan many IPs, hostnames, and CIDR networks
   (e.g. `10.0.0.0/24`) in a single run, or load them from a file.
-- **Parallel scanning** — ports are probed concurrently and hosts are
-  scanned in parallel, making large scans dramatically faster.
+- **Non-blocking scan engine** — every connection in flight is driven from a
+  single thread by an OS event loop (`epoll`/`kqueue`/`select`), so
+  concurrency costs a file descriptor rather than an OS thread. A full
+  1–65535 sweep is ~6× faster than the previous thread-pool engine, and the
+  target is resolved once per host instead of once per port.
+- **SSH ports first** — the handful of ports SSH actually lives on (22, 2222,
+  22222, …) are probed at the head of every sweep, so a service is usually
+  confirmed in well under a second even when the scan covers all 65535 ports.
 - **Two scan back-ends**:
   - `connect` — portable TCP connect scan, no privileges required (default).
   - `syn` — half-open SYN scan via Scapy (faster, requires root).
-- **Reliable SSH validation** — reads the SSH identification banner
-  (RFC 4253) by default, with optional full Paramiko handshake validation.
+- **Reliable SSH validation** — completes the RFC 4253 identification
+  exchange rather than glancing at the first bytes on the wire: servers that
+  print a legal banner first, that wait for the client to identify, or whose
+  banner arrives split across TCP segments are all correctly recognised.
+  Optional full Paramiko handshake validation is available too.
+- **Streaming output (`--stream`)** — newline-delimited JSON events on stdout,
+  flushed as each port opens and each SSH service is confirmed, so a pipeline
+  can act on the first result while the scan is still running.
 - **SSH security audit (`--audit`)** — turns discovery into attack-surface
   intelligence for pentesters: enumerates accepted authentication methods
   (flagging password auth), lists offered KEX/cipher/MAC/host-key algorithms
@@ -27,6 +39,14 @@ speed.
   load-balanced infrastructure.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
+- **Bounded by design** — a process-wide socket budget derived from the
+  file-descriptor limit keeps a large scan from exhausting descriptors and
+  misreporting live services as filtered, and target expansion refuses to
+  materialise a range larger than `--max-targets`.
+- **Early exit on dead hosts** — a host that answers nothing at all across the
+  first few hundred probes is reported as unresponsive instead of consuming
+  one timeout per remaining port. Because SSH's ports are swept first, a live
+  service is always seen first; `--no-early-exit` forces the full range.
 - **Pipelined identification** — the service behind each open port is
   identified (and audited) the instant the port is found, in parallel with the
   rest of the port sweep. SSH services are confirmed without waiting for the
@@ -83,20 +103,30 @@ python sshfinder.py [targets ...] [options]
 | `--validate {banner,paramiko,none}` | SSH validation strategy (default: `banner`). |
 | `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, shared-key correlation). |
 | `-t, --timeout SECONDS` | Per-connection timeout (default: `2.0`). |
-| `-w, --workers N` | Concurrent probes per host (default: `200`). |
+| `-w, --workers N` | Connections in flight per host (default: `512`). |
+| `--max-sockets N` | Ceiling on probe sockets open at once across the whole scan (default: derived from the file-descriptor limit). |
 | `--host-concurrency N` | Hosts scanned in parallel (default: `16`). |
 | `-r, --retries N` | Retries for timed-out probes (default: `0`). |
+| `--max-targets N` | Refuse target lists larger than this (default: `65536`). |
+| `--no-early-exit` | Sweep every port even on hosts that answer nothing at all. |
 | `--json` | Emit results as JSON. |
+| `--stream` | Emit newline-delimited JSON events on stdout as results are found. |
 | `-o, --output FILE` | Write results to a file instead of stdout. |
 | `--no-progress` | Disable the live progress indicator. |
 | `-v` | Verbose (debug) logging. |
 | `-q, --quiet` | Suppress progress and informational logging. |
 
-> **Note on slow scans.** Scanning the full `1-65535` range against a
-> firewalled or unreachable host is inherently slow: every filtered port must
-> wait out the timeout. The progress indicator shows it is still working, and
-> Ctrl+C stops it promptly. To go faster, narrow the ports (e.g.
-> `-p 22,2222`), lower the timeout (`-t 1`), or raise concurrency (`-w`).
+> **Note on slow scans.** A full `1-65535` sweep of a firewalled host still
+> has to wait out a timeout per filtered port. Three things keep that from
+> hurting: SSH's own ports are probed first, so a live service surfaces
+> immediately; a host that answers nothing at all is abandoned after a few
+> hundred silent probes; and `--stream` delivers each result as it lands. To
+> go faster still, narrow the ports (`-p 22,2222`) or lower the timeout
+> (`-t 1`).
+>
+> `-w` bounds the connections one host keeps in flight, but the real ceiling
+> is `--max-sockets`, derived from the process file-descriptor limit and
+> shared across all hosts. Raising `-w` past it has no effect.
 
 `auto` selects the SYN scan when running as root with Scapy installed,
 and otherwise falls back to the privilege-free connect scan.
@@ -125,6 +155,18 @@ Strictly validate SSH with a full handshake:
 
 ```bash
 python sshfinder.py example.com -p 22 --validate paramiko
+```
+
+Stream results into a pipeline as they are found, without waiting for the
+scan to finish:
+
+```bash
+python sshfinder.py 10.0.0.0/24 --stream -q | jq -c 'select(.event=="ssh")'
+```
+
+```
+{"event":"ssh","elapsed":0.164,"host":"10.0.0.5","port":22,"banner":"SSH-2.0-OpenSSH_9.6"}
+{"event":"ssh","elapsed":0.881,"host":"10.0.0.9","port":2222,"banner":"SSH-2.0-dropbear"}
 ```
 
 Audit the SSH attack surface across a subnet (auth methods, weak crypto,

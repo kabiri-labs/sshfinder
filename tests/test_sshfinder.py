@@ -7,6 +7,7 @@ need an optional dependency (Paramiko) skip themselves when it is absent.
 
 import contextlib
 import io
+import json
 import os
 import signal
 import socket
@@ -89,6 +90,28 @@ class LoopbackServer:
 
 def _serve_ssh_banner(conn):
     conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+    conn.recv(64)
+
+
+def _serve_ssh_with_preamble(conn):
+    """RFC 4253 4.2 lets a server precede its identification with free text."""
+    conn.sendall(b"*** Authorized access only ***\r\n")
+    conn.sendall(b"Contact ops@example.com\r\n")
+    conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+    conn.recv(64)
+
+
+def _serve_ssh_client_first(conn):
+    """A server that withholds its banner until the client identifies."""
+    conn.recv(64)
+    conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+
+
+def _serve_ssh_fragmented(conn):
+    """A banner split across TCP segments, as a slow link would deliver it."""
+    conn.sendall(b"SS")
+    time.sleep(0.15)
+    conn.sendall(b"H-2.0-OpenSSH_9.0\r\n")
     conn.recv(64)
 
 
@@ -317,13 +340,14 @@ class ClosedPortTests(unittest.TestCase):
         self.assertEqual(open_ports, [])
         self.assertEqual(closed + filtered, 1)
 
-    def test_probe_port_stop_event_short_circuits(self):
+    def test_sweep_stops_on_stop_event(self):
         stop = threading.Event()
         stop.set()
-        status = sshfinder._probe_port(
-            "127.0.0.1", 1, timeout=1.0, retries=0, stop_event=stop
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [1, 2, 3], timeout=1.0, max_inflight=4, stop_event=stop
         )
-        self.assertEqual(status, sshfinder.FILTERED)
+        self.assertEqual(outcome.probed, 0)
+        self.assertEqual(outcome.open_ports, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -640,6 +664,608 @@ class ServiceIdentificationTests(unittest.TestCase):
         )
         text = sshfinder.render_text([result])
         self.assertIn("10.0.0.1:1234 [service unknown]", text)
+
+
+# --------------------------------------------------------------------------- #
+# Port ordering and target-expansion limits
+# --------------------------------------------------------------------------- #
+class OrderPortsTests(unittest.TestCase):
+    def test_ssh_ports_come_first(self):
+        ordered = sshfinder.order_ports(range(1, 100))
+        self.assertEqual(ordered[0], 22)
+        self.assertEqual(ordered[1], 1)  # Then plain ascending order.
+
+    def test_all_priority_ports_promoted(self):
+        ordered = sshfinder.order_ports([80, 443, 2222, 22, 8022])
+        self.assertEqual(ordered[:3], [22, 2222, 8022])
+        self.assertEqual(ordered[3:], [80, 443])
+
+    def test_deduplicates_and_preserves_every_port(self):
+        ordered = sshfinder.order_ports([22, 22, 80, 80, 443])
+        self.assertEqual(sorted(ordered), [22, 80, 443])
+        self.assertEqual(len(ordered), 3)
+
+    def test_empty_input(self):
+        self.assertEqual(sshfinder.order_ports([]), [])
+
+
+class ExpandTargetsLimitTests(unittest.TestCase):
+    def test_oversized_ipv4_network_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            sshfinder.expand_targets(["10.0.0.0/8"])
+        self.assertIn("max-targets", str(ctx.exception))
+
+    def test_oversized_ipv6_network_rejected(self):
+        # A /64 is 2**64 addresses; materialising it would never return.
+        with self.assertRaises(ValueError):
+            sshfinder.expand_targets(["2001:db8::/64"])
+
+    def test_limit_is_configurable(self):
+        hosts = sshfinder.expand_targets(["192.168.1.0/24"], max_targets=254)
+        self.assertEqual(len(hosts), 254)
+        with self.assertRaises(ValueError):
+            sshfinder.expand_targets(["192.168.1.0/24"], max_targets=10)
+
+    def test_accumulated_tokens_respect_limit(self):
+        with self.assertRaises(ValueError):
+            sshfinder.expand_targets(["10.0.0.1", "10.0.0.2"], max_targets=1)
+
+    def test_invalid_limit_rejected(self):
+        with self.assertRaises(ValueError):
+            sshfinder.expand_targets(["10.0.0.1"], max_targets=0)
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint resolution and the socket budget
+# --------------------------------------------------------------------------- #
+class ResolveEndpointTests(unittest.TestCase):
+    def test_ipv4_literal(self):
+        endpoint = sshfinder.resolve_endpoint("127.0.0.1")
+        self.assertEqual(endpoint.family, socket.AF_INET)
+        self.assertEqual(endpoint.address, "127.0.0.1")
+        self.assertEqual(endpoint.sockaddr(22), ("127.0.0.1", 22))
+
+    def test_ipv6_literal_keeps_scope_fields(self):
+        try:
+            endpoint = sshfinder.resolve_endpoint("::1")
+        except OSError:  # pragma: no cover - host without IPv6 support
+            self.skipTest("no IPv6 resolver support")
+        self.assertEqual(endpoint.family, socket.AF_INET6)
+        self.assertEqual(len(endpoint.sockaddr(22)), 4)
+
+    def test_unresolvable_name_raises(self):
+        with self.assertRaises(OSError):
+            sshfinder.resolve_endpoint("no-such-host.invalid")
+
+
+class SocketBudgetTests(unittest.TestCase):
+    def test_capacity_is_enforced(self):
+        budget = sshfinder.SocketBudget(2)
+        self.assertTrue(budget.acquire())
+        self.assertTrue(budget.acquire())
+        self.assertFalse(budget.acquire())
+        budget.release()
+        self.assertTrue(budget.acquire())
+
+    def test_release_never_goes_negative(self):
+        budget = sshfinder.SocketBudget(1)
+        budget.release(5)
+        self.assertEqual(budget.in_use, 0)
+
+    def test_shrink_halves_to_a_floor(self):
+        budget = sshfinder.SocketBudget(100)
+        self.assertEqual(budget.shrink(floor=32), 50)
+        self.assertEqual(budget.shrink(floor=32), 32)
+        self.assertEqual(budget.shrink(floor=32), 32)
+
+    def test_capacity_is_at_least_one(self):
+        self.assertEqual(sshfinder.SocketBudget(0).capacity, 1)
+
+    def test_default_budget_is_sane(self):
+        self.assertGreaterEqual(sshfinder.default_socket_budget(), 64)
+        self.assertLessEqual(
+            sshfinder.default_socket_budget(), sshfinder.MAX_SOCKET_BUDGET
+        )
+
+    def test_configure_overrides_shared_budget(self):
+        original = sshfinder.shared_socket_budget().capacity
+        self.addCleanup(sshfinder.configure_socket_budget, original)
+        self.assertEqual(sshfinder.configure_socket_budget(7).capacity, 7)
+        self.assertEqual(sshfinder.shared_socket_budget().capacity, 7)
+
+
+# --------------------------------------------------------------------------- #
+# The unresponsive-host gate
+# --------------------------------------------------------------------------- #
+class UnresponsiveGateTests(unittest.TestCase):
+    def test_trips_after_a_run_of_silence(self):
+        gate = sshfinder._UnresponsiveGate(total_ports=5000, threshold=10)
+        for _ in range(9):
+            gate.record(sshfinder.FILTERED)
+        self.assertFalse(gate.tripped())
+        gate.record(sshfinder.FILTERED)
+        self.assertTrue(gate.tripped())
+
+    def test_any_answer_keeps_the_sweep_alive(self):
+        gate = sshfinder._UnresponsiveGate(total_ports=5000, threshold=10)
+        gate.record(sshfinder.CLOSED)
+        for _ in range(50):
+            gate.record(sshfinder.FILTERED)
+        self.assertFalse(gate.tripped())
+
+    def test_small_port_ranges_are_never_cut_short(self):
+        gate = sshfinder._UnresponsiveGate(total_ports=10, threshold=2)
+        for _ in range(10):
+            gate.record(sshfinder.FILTERED)
+        self.assertFalse(gate.tripped())
+
+
+# --------------------------------------------------------------------------- #
+# The connect-scan engine
+# --------------------------------------------------------------------------- #
+class ConnectSweepTests(SSHServerMixin, unittest.TestCase):
+    def test_finds_open_and_closed_ports(self):
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [self.ssh_port, 1], timeout=1.0, max_inflight=8
+        )
+        self.assertEqual(outcome.open_ports, [self.ssh_port])
+        self.assertEqual(outcome.probed, 2)
+        self.assertEqual(outcome.closed + outcome.filtered, 1)
+
+    def test_hands_the_discovery_socket_to_the_caller(self):
+        adopted = {}
+
+        def on_open(port, sock):
+            adopted[port] = sock
+            return True  # Claim ownership.
+
+        sshfinder._connect_sweep(
+            "127.0.0.1", [self.ssh_port], timeout=1.0, max_inflight=4,
+            on_open=on_open,
+        )
+        self.assertIn(self.ssh_port, adopted)
+        sock = adopted[self.ssh_port]
+        self.assertIsNotNone(sock)
+        self.assertGreaterEqual(sock.fileno(), 0)  # Still open for our use.
+        sock.close()
+
+    def test_unadopted_sockets_are_closed_by_the_engine(self):
+        seen = []
+        sshfinder._connect_sweep(
+            "127.0.0.1", [self.ssh_port], timeout=1.0, max_inflight=4,
+            on_open=lambda port, sock: seen.append(sock) or False,
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].fileno(), -1)
+
+    def test_budget_bounds_sockets_in_flight(self):
+        budget = sshfinder.SocketBudget(2)
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [self.ssh_port] + list(range(1, 20)),
+            timeout=1.0, max_inflight=64, budget=budget,
+        )
+        self.assertIn(self.ssh_port, outcome.open_ports)
+        self.assertEqual(outcome.probed, 20)
+        self.assertEqual(budget.in_use, 0)  # Every slot handed back.
+
+    def test_unresolvable_host_raises(self):
+        with self.assertRaises(OSError):
+            sshfinder._connect_sweep(
+                "no-such-host.invalid", [22], timeout=1.0, max_inflight=4
+            )
+
+    def test_empty_port_list(self):
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [], timeout=1.0, max_inflight=4
+        )
+        self.assertEqual(outcome.probed, 0)
+
+
+class SweepPassAbortTests(unittest.TestCase):
+    def test_abort_leaves_remaining_ports_unresolved(self):
+        endpoint = sshfinder.resolve_endpoint("127.0.0.1")
+        budget = sshfinder.SocketBudget(4)
+        _timed_out, unresolved = sshfinder._sweep_pass(
+            endpoint,
+            list(range(1, 200)),
+            timeout=1.0,
+            max_inflight=4,
+            budget=budget,
+            on_result=lambda port, status, sock: False,
+            should_abort=lambda: True,
+        )
+        self.assertTrue(unresolved)
+        self.assertEqual(budget.in_use, 0)
+
+
+class ConnectScanCompatibilityTests(SSHServerMixin, unittest.TestCase):
+    """connect_scan_host keeps its published signature and return shape."""
+
+    def test_positional_signature_and_tuple_result(self):
+        open_ports, closed, filtered = sshfinder.connect_scan_host(
+            "127.0.0.1", [self.ssh_port], 1.0, 4, 0
+        )
+        self.assertEqual(open_ports, [self.ssh_port])
+        self.assertEqual(filtered, 0)
+        self.assertEqual(closed, 0)
+
+    def test_on_open_receives_only_the_port(self):
+        seen = []
+        sshfinder.connect_scan_host(
+            "127.0.0.1", [self.ssh_port], 1.0, 4, 0, on_open=seen.append
+        )
+        self.assertEqual(seen, [self.ssh_port])
+
+
+class ReprobeSSHPortsTests(unittest.TestCase):
+    def _reprobe(self, candidates, outcome):
+        sshfinder._reprobe_ssh_ports(
+            "127.0.0.1",
+            sshfinder.resolve_endpoint("127.0.0.1"),
+            candidates,
+            outcome,
+            timeout=1.0,
+            budget=sshfinder.SocketBudget(8),
+            stop_event=None,
+            progress=None,
+            on_open=None,
+        )
+
+    def test_recovers_a_priority_port_the_sweep_missed(self):
+        server = LoopbackServer(_serve_ssh_banner).start()
+        self.addCleanup(server.stop)
+        outcome = sshfinder._SweepOutcome(filtered=1, probed=1,
+                                          unresponsive=True)
+        self._reprobe([server.port], outcome)
+        self.assertEqual(outcome.open_ports, [server.port])
+        self.assertEqual(outcome.filtered, 0)   # No longer counted filtered.
+        self.assertFalse(outcome.unresponsive)  # A live port disproves it.
+
+    def test_closed_port_moves_from_filtered_to_closed(self):
+        outcome = sshfinder._SweepOutcome(filtered=1, probed=1)
+        self._reprobe([1], outcome)  # Loopback port 1 refuses immediately.
+        self.assertEqual(outcome.filtered, 0)
+        self.assertEqual(outcome.closed, 1)
+        self.assertEqual(outcome.open_ports, [])
+
+    def test_no_candidates_is_a_noop(self):
+        outcome = sshfinder._SweepOutcome(filtered=5)
+        self._reprobe([], outcome)
+        self.assertEqual(outcome.filtered, 5)
+
+    def test_only_silent_priority_ports_become_candidates(self):
+        """A port that answered is never re-probed, so tallies stay honest."""
+        with LoopbackServer(_serve_ssh_banner) as server:
+            with mock.patch.object(
+                sshfinder, "SSH_PRIORITY_PORTS", (server.port, 1)
+            ):
+                outcome = sshfinder._connect_sweep(
+                    "127.0.0.1", [server.port, 1], timeout=1.0, max_inflight=4
+                )
+        # One open, one closed, nothing filtered and nothing double-counted.
+        self.assertEqual(outcome.open_ports, [server.port])
+        self.assertEqual(outcome.closed, 1)
+        self.assertEqual(outcome.filtered, 0)
+        self.assertEqual(outcome.probed, 2)
+
+
+class ChunkTests(unittest.TestCase):
+    def test_splits_into_batches(self):
+        self.assertEqual(
+            list(sshfinder._chunk([1, 2, 3, 4, 5], 2)), [[1, 2], [3, 4], [5]]
+        )
+
+    def test_empty_input(self):
+        self.assertEqual(list(sshfinder._chunk([], 4)), [])
+
+
+# --------------------------------------------------------------------------- #
+# Buffered reads and SSH identification
+# --------------------------------------------------------------------------- #
+class BufferedReaderTests(unittest.TestCase):
+    def _pair(self):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        return left, right
+
+    def test_reads_lines_across_segment_boundaries(self):
+        left, right = self._pair()
+        right.sendall(b"first\r\nsec")
+        right.sendall(b"ond\nthird\n")
+        reader = sshfinder._BufferedReader(left, 2.0)
+        self.assertEqual(reader.read_line(1024), b"first")
+        self.assertEqual(reader.read_line(1024), b"second")
+        self.assertEqual(reader.read_line(1024), b"third")
+
+    def test_read_exact_follows_a_line_on_the_same_stream(self):
+        left, right = self._pair()
+        right.sendall(b"SSH-2.0-X\r\n" + b"\x00\x01\x02\x03binary")
+        reader = sshfinder._BufferedReader(left, 2.0)
+        self.assertEqual(reader.read_line(1024), b"SSH-2.0-X")
+        self.assertEqual(reader.read_exact(4), b"\x00\x01\x02\x03")
+        self.assertEqual(reader.read_exact(6), b"binary")
+
+    def test_read_exact_raises_when_the_peer_closes(self):
+        left, right = self._pair()
+        right.sendall(b"short")
+        right.close()
+        reader = sshfinder._BufferedReader(left, 2.0)
+        with self.assertRaises(OSError):
+            reader.read_exact(64)
+
+    def test_read_line_gives_up_on_a_non_line_protocol(self):
+        left, right = self._pair()
+        right.sendall(b"x" * 200)
+        reader = sshfinder._BufferedReader(left, 2.0)
+        self.assertIsNone(reader.read_line(64))
+
+    def test_deadline_bounds_a_silent_peer(self):
+        left, _right = self._pair()
+        reader = sshfinder._BufferedReader(left, 0.2)
+        start = time.monotonic()
+        self.assertIsNone(reader.read_line(1024))
+        self.assertLess(time.monotonic() - start, 2.0)
+
+
+class ReadSSHIdentificationTests(unittest.TestCase):
+    def _reader(self, payload):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        right.sendall(payload)
+        right.close()
+        return sshfinder._BufferedReader(left, 1.0)
+
+    def test_skips_preamble_lines(self):
+        reader = self._reader(
+            b"legal notice\r\nmotd\r\nSSH-2.0-OpenSSH_9.6\r\n"
+        )
+        self.assertEqual(
+            sshfinder.read_ssh_identification(reader), "SSH-2.0-OpenSSH_9.6"
+        )
+
+    def test_returns_none_without_an_identification(self):
+        reader = self._reader(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        self.assertIsNone(sshfinder.read_ssh_identification(reader))
+
+    def test_preamble_length_is_bounded(self):
+        reader = self._reader(b"noise\n" * 50 + b"SSH-2.0-X\r\n")
+        self.assertIsNone(
+            sshfinder.read_ssh_identification(reader, max_lines=5)
+        )
+
+
+class GrabBannerTests(unittest.TestCase):
+    """Server behaviours a lone recv() would misread as 'not SSH'."""
+
+    def _banner_for(self, handler):
+        with LoopbackServer(handler) as server:
+            return sshfinder.grab_ssh_banner("127.0.0.1", server.port, 2.0)
+
+    def test_plain_banner(self):
+        self.assertEqual(
+            self._banner_for(_serve_ssh_banner), "SSH-2.0-OpenSSH_9.0"
+        )
+
+    def test_banner_behind_a_preamble(self):
+        self.assertEqual(
+            self._banner_for(_serve_ssh_with_preamble), "SSH-2.0-OpenSSH_9.0"
+        )
+
+    def test_server_that_waits_for_the_client(self):
+        self.assertEqual(
+            self._banner_for(_serve_ssh_client_first), "SSH-2.0-OpenSSH_9.0"
+        )
+
+    def test_banner_split_across_segments(self):
+        self.assertEqual(
+            self._banner_for(_serve_ssh_fragmented), "SSH-2.0-OpenSSH_9.0"
+        )
+
+    def test_non_ssh_service_rejected(self):
+        self.assertIsNone(self._banner_for(_serve_http))
+
+    def test_adopted_socket_is_used_and_always_closed(self):
+        with LoopbackServer(_serve_ssh_banner) as server:
+            sock = socket.create_connection(
+                ("127.0.0.1", server.port), timeout=2
+            )
+            banner = sshfinder.grab_ssh_banner(
+                "127.0.0.1", server.port, 2.0, sock=sock
+            )
+        self.assertEqual(banner, "SSH-2.0-OpenSSH_9.0")
+        self.assertEqual(sock.fileno(), -1)
+
+    def test_adopted_socket_closed_even_when_the_peer_is_silent(self):
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        self.assertIsNone(
+            sshfinder.grab_ssh_banner("127.0.0.1", 22, 0.2, sock=left)
+        )
+        self.assertEqual(left.fileno(), -1)
+
+    def test_unreachable_port_returns_none(self):
+        self.assertIsNone(sshfinder.grab_ssh_banner("127.0.0.1", 1, 1.0))
+
+
+class ValidateSSHPortsTests(SSHServerMixin, unittest.TestCase):
+    def test_confirms_only_the_ssh_port(self):
+        confirmed = sshfinder.validate_ssh_ports(
+            "127.0.0.1", [self.ssh_port, 1], timeout=1.0, workers=4,
+            method="banner",
+        )
+        self.assertEqual(list(confirmed), [self.ssh_port])
+
+    def test_none_method_short_circuits(self):
+        self.assertEqual(
+            sshfinder.validate_ssh_ports(
+                "127.0.0.1", [self.ssh_port], timeout=1.0, workers=4,
+                method="none",
+            ),
+            {},
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Connection reuse end to end
+# --------------------------------------------------------------------------- #
+class ConnectionReuseTests(unittest.TestCase):
+    def test_confirmed_ssh_service_costs_one_handshake(self):
+        """Discovery and identification share a connection, not two."""
+        accepted = []
+        lock = threading.Lock()
+
+        def counting_ssh(conn):
+            with lock:
+                accepted.append(1)
+            conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+            conn.recv(64)
+
+        with LoopbackServer(counting_ssh) as server:
+            result = sshfinder.scan_host(
+                "127.0.0.1",
+                [server.port],
+                scan_method="connect",
+                validate="banner",
+                timeout=1.0,
+                workers=4,
+                retries=0,
+            )
+            self.assertEqual(result.ssh_ports, [server.port])
+            time.sleep(0.1)  # Let a stray second connection land, if any.
+            with lock:
+                self.assertEqual(sum(accepted), 1)
+
+
+class ScanHostEarlyExitTests(SSHServerMixin, unittest.TestCase):
+    def test_early_exit_flag_defaults_to_clear(self):
+        result = sshfinder.scan_host(
+            "127.0.0.1",
+            [self.ssh_port],
+            scan_method="connect",
+            validate="banner",
+            timeout=1.0,
+            workers=4,
+            retries=0,
+        )
+        self.assertFalse(result.early_exit)
+        self.assertIn("early_exit", result.as_dict())
+
+    def test_unresolvable_host_is_reported_as_an_error(self):
+        result = sshfinder.scan_host(
+            "no-such-host.invalid",
+            [22],
+            scan_method="connect",
+            validate="banner",
+            timeout=1.0,
+            workers=4,
+            retries=0,
+        )
+        self.assertIsNotNone(result.error)
+
+
+class EarlyExitRenderTests(unittest.TestCase):
+    def test_text_explains_the_early_exit(self):
+        result = sshfinder.HostResult(host="h", filtered=65535, early_exit=True)
+        text = sshfinder.render_text([result])
+        self.assertIn("stopped", text)
+        self.assertIn("--no-early-exit", text)
+
+
+# --------------------------------------------------------------------------- #
+# Streaming events
+# --------------------------------------------------------------------------- #
+class EventStreamTests(unittest.TestCase):
+    def test_emits_one_json_object_per_line(self):
+        buffer = io.StringIO()
+        stream = sshfinder.EventStream(buffer)
+        stream.emit("ssh", host="10.0.0.1", port=22)
+        stream.emit("summary", ssh_services=1)
+        lines = buffer.getvalue().strip().split("\n")
+        self.assertEqual(len(lines), 2)
+        first = json.loads(lines[0])
+        self.assertEqual(first["event"], "ssh")
+        self.assertEqual(first["host"], "10.0.0.1")
+        self.assertEqual(first["port"], 22)
+        self.assertIn("elapsed", first)
+        self.assertEqual(json.loads(lines[1])["event"], "summary")
+
+    def test_disabled_stream_writes_nothing(self):
+        buffer = io.StringIO()
+        sshfinder.EventStream(buffer, enabled=False).emit("ssh", port=22)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_a_broken_pipe_does_not_abort_the_scan(self):
+        buffer = io.StringIO()
+        buffer.close()
+        stream = sshfinder.EventStream(buffer)
+        stream.emit("ssh", port=22)  # Must not raise.
+        self.assertFalse(stream.enabled)
+
+    def test_scan_streams_the_service_before_the_summary(self):
+        buffer = io.StringIO()
+        stream = sshfinder.EventStream(buffer)
+        with LoopbackServer(_serve_ssh_banner) as server:
+            sshfinder.scan_targets(
+                ["127.0.0.1"],
+                [server.port],
+                scan_method="connect",
+                validate="banner",
+                timeout=1.0,
+                workers=4,
+                retries=0,
+                host_concurrency=1,
+                stream=stream,
+            )
+        events = [json.loads(line) for line in
+                  buffer.getvalue().strip().split("\n")]
+        names = [e["event"] for e in events]
+        self.assertEqual(names[0], "open")
+        self.assertIn("ssh", names)
+        self.assertEqual(names[-1], "summary")
+        self.assertLess(names.index("ssh"), names.index("summary"))
+        self.assertEqual(events[-1]["ssh_services"], 1)
+
+
+# --------------------------------------------------------------------------- #
+# CLI surface
+# --------------------------------------------------------------------------- #
+class CLITests(unittest.TestCase):
+    def test_new_flags_are_accepted(self):
+        args = sshfinder.build_parser().parse_args(
+            ["10.0.0.1", "--stream", "--no-early-exit",
+             "--max-sockets", "128", "--max-targets", "10"]
+        )
+        self.assertTrue(args.stream)
+        self.assertTrue(args.no_early_exit)
+        self.assertEqual(args.max_sockets, 128)
+        self.assertEqual(args.max_targets, 10)
+
+    def test_defaults(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertFalse(args.stream)
+        self.assertFalse(args.no_early_exit)
+        self.assertEqual(args.max_targets, sshfinder.DEFAULT_MAX_TARGETS)
+
+    def test_negative_limits_are_rejected(self):
+        for flag in ("--max-targets", "--max-sockets"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(SystemExit):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        sshfinder.run(["10.0.0.1", flag, "-1"])
+
+    def test_stream_mode_emits_only_jsonl(self):
+        with LoopbackServer(_serve_ssh_banner) as server:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = sshfinder.run(
+                    ["127.0.0.1", "-p", str(server.port), "--stream", "-q"]
+                )
+        self.assertEqual(exit_code, 0)
+        events = [json.loads(line) for line in
+                  stdout.getvalue().strip().split("\n")]
+        self.assertTrue(all("event" in e for e in events))
+        self.assertEqual(events[-1]["event"], "summary")
 
 
 if __name__ == "__main__":  # pragma: no cover
