@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.8.0-blue)
+![version](https://img.shields.io/badge/version-2.9.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -90,8 +90,12 @@ speed.
 - **Clear host status** — distinguishes open, closed, and *filtered* ports,
   so a firewalled or unreachable host is reported as such instead of looking
   like a hang.
-- **Machine-readable output** — human-friendly text or `--json`, optionally
-  written to a file.
+- **Machine-readable output** — `--format text|json|sarif|csv`, optionally
+  written to a file. **SARIF 2.1.0** for security tooling (validated against
+  the OASIS schema; findings are anchored to `host:port` logical locations and
+  carry stable fingerprints so a consumer tracks the same finding across
+  runs). **CSV** for a spreadsheet: one row per confirmed SSH service, which
+  is the shape an asset inventory actually gets filtered and sorted in.
 
 ## Installation
 
@@ -145,7 +149,8 @@ python sshfinder.py [targets ...] [options]
 | `-r, --retries N` | Retries for timed-out probes (default: `0`). |
 | `--max-targets N` | Refuse target lists larger than this (default: `65536`). |
 | `--no-early-exit` | Sweep every port even on hosts that answer nothing at all. |
-| `--json` | Emit results as JSON. |
+| `--format {text,json,sarif,csv}` | Output format (default: `text`). |
+| `--json` | Shorthand for `--format json`. |
 | `--stream` | Emit newline-delimited JSON events on stdout as results are found. |
 | `-o, --output FILE` | Write results to a file instead of stdout. |
 | `--no-progress` | Disable the live progress indicator. |
@@ -295,6 +300,34 @@ Available checks: `password_auth`, `terrapin`, `weak_algorithms`,
 `forbid` / `require` over a `field` of `kex_algorithms`,
 `host_key_algorithms`, `ciphers` or `macs`. Anything else is rejected when
 the policy loads.
+
+Export the SSH inventory to a spreadsheet, one row per service:
+
+```bash
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --audit --format csv -o ssh.csv
+```
+
+Emit SARIF 2.1.0 for security tooling:
+
+```bash
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --policy baseline --format sarif \
+    -o sshfinder.sarif
+```
+
+Each finding is anchored to a `host:port` **logical location** — the part of
+SARIF meant for results that are not tied to a source file — and carries a
+stable `partialFingerprints` entry so a consumer tracks the same finding
+across runs rather than opening a fresh alert every night. When `--policy` is
+given the policy violations *are* the findings; without one, the intrinsic
+audit findings are reported instead. Either way each finding appears once.
+
+> **On GitHub code scanning.** SARIF results must carry a non-empty artifact
+> location or `upload-sarif` rejects the file, so a synthetic
+> `ssh://host:port` URI is emitted alongside the logical location. It does not
+> resolve to a file in your repository, so alerts appear without a code
+> anchor. Treat this output as SARIF for security tooling generally — the
+> VS Code SARIF viewer, Azure DevOps, archival — rather than as a way to get
+> network findings annotated onto a diff.
 
 Track an estate over time — capture a report, then compare against it:
 

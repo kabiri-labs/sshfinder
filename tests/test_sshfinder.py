@@ -6,6 +6,7 @@ need an optional dependency (Paramiko) skip themselves when it is absent.
 """
 
 import contextlib
+import csv
 import io
 import json
 import logging
@@ -1698,6 +1699,296 @@ class BaselineCLITests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("=== 127.0.0.1 ===", report)
         self.assertIn("Baseline drift", report)
+
+
+# --------------------------------------------------------------------------- #
+# Interchange formats
+# --------------------------------------------------------------------------- #
+def _service(host="10.0.0.1", port=22, banner="SSH-2.0-OpenSSH_9.6", **audit):
+    audit_obj = sshfinder.SSHAudit(host=host, port=port, **audit)
+    return sshfinder.HostResult(
+        host=host, open_ports=[port], ssh_ports=[port],
+        banners={port: banner}, audits={port: audit_obj},
+    )
+
+
+class RenderSarifTests(unittest.TestCase):
+    def _sarif(self, results, policed=False):
+        return json.loads(sshfinder.render_sarif(results, policed=policed))
+
+    def test_envelope_is_sarif_210(self):
+        doc = self._sarif([])
+        self.assertEqual(doc["version"], "2.1.0")
+        self.assertIn("sarif-schema-2.1.0.json", doc["$schema"])
+        driver = doc["runs"][0]["tool"]["driver"]
+        self.assertEqual(driver["name"], "sshfinder")
+        self.assertEqual(driver["version"], sshfinder.__version__)
+
+    def test_rule_catalogue_is_stable_across_scans(self):
+        """A consumer should not see rules blink in and out run to run."""
+        empty = self._sarif([])
+        found = self._sarif([_service(weaknesses=["weak ciphers: aes128-cbc"])])
+        self.assertEqual(
+            [r["id"] for r in empty["runs"][0]["tool"]["driver"]["rules"]],
+            [r["id"] for r in found["runs"][0]["tool"]["driver"]["rules"]],
+        )
+        self.assertEqual(empty["runs"][0]["results"], [])
+
+    def test_each_intrinsic_finding_becomes_a_result(self):
+        doc = self._sarif([_service(
+            weaknesses=["weak ciphers: aes128-cbc"],
+            terrapin_vulnerable=True,
+            auth_methods=["publickey", "password"],
+            pq_status=sshfinder.PQ_ABSENT,
+        )])
+        levels = {r["ruleId"]: r["level"] for r in doc["runs"][0]["results"]}
+        self.assertEqual(levels["weak-algorithms"], "error")
+        self.assertEqual(levels["terrapin"], "error")
+        self.assertEqual(levels["password-auth"], "warning")
+        self.assertEqual(levels["post-quantum"], "warning")
+
+    def test_pre_standard_post_quantum_is_reported(self):
+        doc = self._sarif([_service(
+            pq_status=sshfinder.PQ_LEGACY, pq_kex=["kyber-draft"]
+        )])
+        result = doc["runs"][0]["results"][0]
+        self.assertEqual(result["ruleId"], "post-quantum")
+        self.assertIn("pre-standard", result["message"]["text"])
+
+    def test_healthy_service_produces_no_results(self):
+        doc = self._sarif([_service(
+            terrapin_vulnerable=False, pq_status=sshfinder.PQ_READY
+        )])
+        self.assertEqual(doc["runs"][0]["results"], [])
+
+    def test_rule_index_points_at_the_declared_rule(self):
+        doc = self._sarif([_service(weaknesses=["bad"])])
+        rules = doc["runs"][0]["tool"]["driver"]["rules"]
+        for result in doc["runs"][0]["results"]:
+            self.assertEqual(rules[result["ruleIndex"]]["id"], result["ruleId"])
+
+    def test_location_names_the_socket(self):
+        doc = self._sarif([_service(host="10.0.0.9", port=2222,
+                                    weaknesses=["bad"])])
+        location = doc["runs"][0]["results"][0]["locations"][0]
+        logical = location["logicalLocations"][0]
+        self.assertEqual(logical["fullyQualifiedName"], "10.0.0.9:2222")
+        # Non-empty, because an empty artifact location is rejected on upload.
+        uri = location["physicalLocation"]["artifactLocation"]["uri"]
+        self.assertTrue(uri)
+        self.assertIn("10.0.0.9:2222", uri)
+
+    def test_fingerprints_are_stable_and_distinguish_findings(self):
+        def scan():
+            return self._sarif([
+                _service(weaknesses=["bad"], terrapin_vulnerable=True)
+            ])
+
+        first, again = scan(), scan()
+        prints = [r["partialFingerprints"] for r in first["runs"][0]["results"]]
+        repeat = [r["partialFingerprints"] for r in again["runs"][0]["results"]]
+        self.assertEqual(prints, repeat)           # Same finding, same id.
+        self.assertNotEqual(prints[0], prints[1])  # Different rules differ.
+
+    def test_a_policy_run_reports_violations_instead(self):
+        """Violations are the findings then; reporting both would duplicate."""
+        results = [_service(
+            weaknesses=["weak ciphers: aes128-cbc"],
+            violations=[sshfinder.Violation(
+                "weak_algorithms", sshfinder.SEVERITY_FAIL, "aes128-cbc"
+            )],
+        )]
+        doc = self._sarif(results, policed=True)
+        ids = [r["ruleId"] for r in doc["runs"][0]["results"]]
+        self.assertEqual(ids, ["policy/weak_algorithms"])
+        self.assertNotIn("weak-algorithms", ids)
+
+    def test_policy_severity_maps_to_sarif_level(self):
+        results = [_service(violations=[
+            sshfinder.Violation("terrapin", sshfinder.SEVERITY_FAIL, "x"),
+            sshfinder.Violation("post_quantum", sshfinder.SEVERITY_WARN, "y"),
+        ])]
+        doc = self._sarif(results, policed=True)
+        levels = {r["ruleId"]: r["level"] for r in doc["runs"][0]["results"]}
+        self.assertEqual(levels["policy/terrapin"], "error")
+        self.assertEqual(levels["policy/post_quantum"], "warning")
+
+    def test_policy_rules_are_declared(self):
+        results = [_service(violations=[
+            sshfinder.Violation("forbid", sshfinder.SEVERITY_FAIL, "x")
+        ])]
+        doc = self._sarif(results, policed=True)
+        declared = {r["id"] for r in doc["runs"][0]["tool"]["driver"]["rules"]}
+        self.assertIn("policy/forbid", declared)
+
+
+class RenderCsvTests(unittest.TestCase):
+    def _rows(self, results):
+        return list(csv.reader(io.StringIO(sshfinder.render_csv(results))))
+
+    def test_header_matches_the_declared_columns(self):
+        self.assertEqual(self._rows([])[0], list(sshfinder.CSV_COLUMNS))
+
+    def test_one_row_per_ssh_service(self):
+        results = [
+            sshfinder.HostResult(
+                host="10.0.0.1", open_ports=[22, 2222], ssh_ports=[22, 2222],
+                banners={22: "a", 2222: "b"},
+            ),
+            sshfinder.HostResult(host="10.0.0.2", open_ports=[80]),
+        ]
+        rows = self._rows(results)
+        self.assertEqual(len(rows), 3)  # Header plus two services.
+        self.assertEqual([r[1] for r in rows[1:]], ["22", "2222"])
+
+    def test_lists_are_joined_readably(self):
+        rows = self._rows([_service(
+            weaknesses=["weak ciphers: aes128-cbc", "weak MACs: hmac-md5"],
+            pq_kex=["mlkem768x25519-sha256"],
+        )])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(
+            columns["weaknesses"],
+            "weak ciphers: aes128-cbc; weak MACs: hmac-md5",
+        )
+
+    def test_unmeasured_password_auth_is_blank_not_false(self):
+        """An empty auth probe must not read as 'no password login'."""
+        rows = self._rows([_service(auth_methods=[])])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(columns["password_auth"], "")
+
+    def test_measured_password_auth_is_reported(self):
+        rows = self._rows([_service(auth_methods=["publickey", "password"])])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(columns["password_auth"], "true")
+        rows = self._rows([_service(auth_methods=["publickey"])])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(columns["password_auth"], "false")
+
+    def test_unknown_terrapin_is_blank(self):
+        rows = self._rows([_service()])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(columns["terrapin_vulnerable"], "")
+
+    def test_a_comma_in_a_banner_is_quoted(self):
+        results = [sshfinder.HostResult(
+            host="10.0.0.1", open_ports=[22], ssh_ports=[22],
+            banners={22: "SSH-2.0-Weird, Server"},
+        )]
+        rows = self._rows(results)
+        self.assertEqual(rows[1][2], "SSH-2.0-Weird, Server")
+
+    def test_violations_carry_their_severity(self):
+        rows = self._rows([_service(violations=[
+            sshfinder.Violation("terrapin", sshfinder.SEVERITY_FAIL, "x")
+        ])])
+        columns = dict(zip(sshfinder.CSV_COLUMNS, rows[1]))
+        self.assertEqual(columns["violations"], "fail:terrapin")
+
+    def test_service_without_an_audit_still_produces_a_row(self):
+        results = [sshfinder.HostResult(
+            host="10.0.0.1", open_ports=[22], ssh_ports=[22],
+            banners={22: "SSH-2.0-X"},
+        )]
+        rows = self._rows(results)
+        self.assertEqual(rows[1][0], "10.0.0.1")
+        self.assertEqual(rows[1][2], "SSH-2.0-X")
+
+
+class OutputFormatCLITests(unittest.TestCase):
+    def _serve(self, kex):
+        payload = build_kexinit_payload(
+            kex=list(kex), hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+
+        def serve(conn):
+            conn.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        return serve
+
+    def _run(self, port, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = sshfinder.run(["127.0.0.1", "-p", str(port), "-q", *extra])
+        return code, stdout.getvalue()
+
+    def test_default_is_text(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertIsNone(args.format)
+        self.assertFalse(args.json)
+
+    def test_json_flag_still_works(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            _, out = self._run(server.port, "--json")
+        self.assertEqual(json.loads(out)[0]["host"], "127.0.0.1")
+
+    def test_format_json_matches_the_json_flag(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            _, viaflag = self._run(server.port, "--json")
+            _, viaformat = self._run(server.port, "--format", "json")
+
+        def shape(report):
+            # rtt_ms is measured, so two scans of the same host differ by
+            # microseconds; the claim under test is the format, not the timing.
+            return [
+                {k: v for k, v in host.items() if k != "rtt_ms"}
+                for host in json.loads(report)
+            ]
+
+        self.assertEqual(shape(viaflag), shape(viaformat))
+
+    def test_conflicting_format_requests_are_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["127.0.0.1", "-p", "22", "--json",
+                               "--format", "csv"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_json_alongside_format_json_is_allowed(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            code, _ = self._run(server.port, "--json", "--format", "json")
+        self.assertEqual(code, 0)
+
+    def test_sarif_output(self):
+        with LoopbackServer(self._serve(["curve25519-sha256"])) as server:
+            code, out = self._run(server.port, "--pq-report",
+                                  "--format", "sarif")
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual(doc["version"], "2.1.0")
+        ids = [r["ruleId"] for r in doc["runs"][0]["results"]]
+        self.assertIn("post-quantum", ids)
+
+    def test_sarif_under_a_policy_reports_violations(self):
+        with LoopbackServer(self._serve(["curve25519-sha256"])) as server:
+            code, out = self._run(server.port, "--policy", "pq",
+                                  "--format", "sarif")
+        self.assertEqual(code, sshfinder.EXIT_POLICY_VIOLATION)
+        ids = [r["ruleId"] for r in json.loads(out)["runs"][0]["results"]]
+        self.assertEqual(ids, ["policy/post_quantum"])
+
+    def test_csv_output(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            code, out = self._run(server.port, "--pq-report", "--format", "csv")
+        self.assertEqual(code, 0)
+        rows = list(csv.reader(io.StringIO(out)))
+        self.assertEqual(rows[0], list(sshfinder.CSV_COLUMNS))
+        self.assertEqual(rows[1][0], "127.0.0.1")
+
+    def test_format_is_honoured_when_writing_to_a_file(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "out.sarif")
+        with LoopbackServer(self._serve(["curve25519-sha256"])) as server:
+            sshfinder.run(["127.0.0.1", "-p", str(server.port), "-q",
+                           "--pq-report", "--format", "sarif", "-o", path])
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["version"], "2.1.0")
 
 
 class LoggingTests(unittest.TestCase):
