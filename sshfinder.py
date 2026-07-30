@@ -48,7 +48,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -119,6 +119,33 @@ WEAK_HOST_KEYS = {
     "ssh-dss-cert-v01@openssh.com",
 }
 
+# Post-quantum key exchange readiness.
+#
+# The standardised hybrids, and the only ones a current OpenSSH client will
+# actually pick: ML-KEM (FIPS 203) and Streamlined NTRU Prime, each combined
+# with X25519 so the result is no weaker than classical ECDH. OpenSSH has
+# offered sntrup761 since 9.0 and ML-KEM since 9.9, and made
+# mlkem768x25519-sha256 the default in 10.0.
+PQ_KEX_STANDARD = frozenset({
+    "mlkem768x25519-sha256",
+    "mlkem768x25519-sha256@openssh.com",
+    "sntrup761x25519-sha512",
+    "sntrup761x25519-sha512@openssh.com",
+})
+# Substrings that identify a post-quantum hybrid of any vintage, including
+# pre-standard vendor drafts such as sntrup4591761x25519-sha512@tinyssh.org
+# and x25519-kyber-512r3-sha256-d00@amazon.com. Matching on the family rather
+# than enumerating every draft name keeps unknown spellings out of the
+# "no post-quantum support at all" bucket, where they would read as a
+# finding the server does not deserve.
+PQ_KEX_MARKERS = ("mlkem", "sntrup", "kyber")
+
+# Post-quantum readiness verdicts.
+PQ_READY = "ready"
+PQ_LEGACY = "legacy"
+PQ_ABSENT = "absent"
+PQ_UNKNOWN = "unknown"
+
 
 # --------------------------------------------------------------------------- #
 # Result model
@@ -144,6 +171,8 @@ class SSHAudit:
     macs: list[str] = field(default_factory=list)
     weaknesses: list[str] = field(default_factory=list)
     terrapin_vulnerable: Optional[bool] = None
+    pq_status: str = PQ_UNKNOWN
+    pq_kex: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -166,6 +195,8 @@ class SSHAudit:
             "macs": self.macs,
             "weaknesses": self.weaknesses,
             "terrapin_vulnerable": self.terrapin_vulnerable,
+            "pq_status": self.pq_status,
+            "pq_kex": self.pq_kex,
             "notes": self.notes,
         }
 
@@ -1425,6 +1456,7 @@ def audit_ssh_service(
         audit.macs = _unique(kex.get("mac_s2c", []), kex.get("mac_c2s", []))
         audit.weaknesses = assess_weaknesses(kex)
         audit.terrapin_vulnerable = is_terrapin_vulnerable(kex)
+        audit.pq_status, audit.pq_kex = assess_post_quantum(kex)
 
     if deep:
         try:
@@ -1531,6 +1563,43 @@ def is_terrapin_vulnerable(kex: dict) -> bool:
     has_cbc = any(c.endswith("-cbc") for c in ciphers)
     has_etm = any(m.endswith("-etm@openssh.com") for m in macs)
     return has_cbc and has_etm
+
+
+def assess_post_quantum(kex: Optional[dict]) -> tuple:
+    """Classify a server's post-quantum key exchange readiness.
+
+    Returns ``(status, pq_algorithms)``.
+
+    This is a statement about capability, not about what any particular
+    session will negotiate. RFC 4253 picks the first algorithm on the
+    *client's* list that the server also supports, so the client decides the
+    outcome; what a scan can establish is what the server makes possible. The
+    verdicts are therefore phrased in terms of what a current client would get:
+
+    * ``ready``  -- a standardised hybrid is offered, so a current OpenSSH
+      client negotiates post-quantum key agreement.
+    * ``legacy`` -- only pre-standard hybrids are offered. This looks
+      post-quantum in an algorithm dump but is not: OpenSSH dropped the
+      withdrawn sntrup4591761 parameter set in 2020, so a current client finds
+      no common post-quantum method and falls back to classical crypto.
+    * ``absent`` -- no post-quantum key exchange at all. Every session is
+      exposed to store-now-decrypt-later capture.
+    * ``unknown`` -- the KEXINIT could not be read, so nothing is claimed.
+    """
+    if not kex:
+        return PQ_UNKNOWN, []
+    offered = kex.get("kex")
+    if not offered:
+        return PQ_UNKNOWN, []
+    candidates = [
+        name for name in offered
+        if any(marker in name.lower() for marker in PQ_KEX_MARKERS)
+    ]
+    if not candidates:
+        return PQ_ABSENT, []
+    if any(name in PQ_KEX_STANDARD for name in candidates):
+        return PQ_READY, candidates
+    return PQ_LEGACY, candidates
 
 
 def assess_weaknesses(kex: dict) -> list[str]:
@@ -1666,6 +1735,7 @@ def scan_host(
     workers: int,
     retries: int,
     audit: bool = False,
+    audit_deep: bool = True,
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
     stream: Optional[EventStream] = None,
@@ -1706,7 +1776,7 @@ def scan_host(
         try:
             future = assess_pool.submit(
                 _assess_service, host, port, timeout, validate, audit,
-                stop_event, progress, sock, stream,
+                stop_event, progress, sock, stream, audit_deep,
             )
         except RuntimeError:  # pragma: no cover - pool already shutting down
             return False
@@ -1787,11 +1857,15 @@ def _assess_service(
     progress: Optional[ProgressReporter],
     sock: Optional[socket.socket] = None,
     stream: Optional[EventStream] = None,
+    audit_deep: bool = True,
 ) -> _Assessment:
     """Identify (and optionally audit) the service behind a single open port.
 
     ``sock`` is the connection that discovered the port; it is consumed or
-    closed here, never leaked back to the caller.
+    closed here, never leaked back to the caller. ``audit_deep`` controls
+    whether the audit also runs the Paramiko partial handshake; the algorithm
+    inventory, Terrapin check and post-quantum verdict all come from the
+    KEXINIT and need neither Paramiko nor the extra connection.
     """
     assessment = _Assessment(port=port)
     if stop_event is not None and stop_event.is_set():
@@ -1817,7 +1891,7 @@ def _assess_service(
         stream.emit("ssh", host=host, port=port, banner=banner)
 
     if audit and not (stop_event is not None and stop_event.is_set()):
-        info = audit_ssh_service(host, port, timeout)
+        info = audit_ssh_service(host, port, timeout, deep=audit_deep)
         assessment.audit = info
         _report_audit(progress, info)
         if stream is not None:
@@ -1856,6 +1930,7 @@ def scan_targets(
     retries: int,
     host_concurrency: int,
     audit: bool = False,
+    audit_deep: bool = True,
     progress: Optional[ProgressReporter] = None,
     stream: Optional[EventStream] = None,
     early_exit: bool = True,
@@ -1909,6 +1984,7 @@ def scan_targets(
             workers=workers,
             retries=retries,
             audit=audit,
+            audit_deep=audit_deep,
             stop_event=stop_event,
             progress=progress,
             stream=stream,
@@ -2045,6 +2121,9 @@ def render_text(results: list[HostResult]) -> str:
             lines.append("  no SSH services confirmed")
 
     lines.append("")
+    if any(result.audits for result in results):
+        lines.append(render_pq_report(results))
+        lines.append("")
     shared_keys = correlate_host_keys(results)
     if shared_keys:
         lines.append("Shared SSH host keys (possible shared/cloned hosts):")
@@ -2075,11 +2154,83 @@ def _render_audit(audit: Optional[SSHAudit]) -> list[str]:
         lines.append(f"       auth: {', '.join(audit.auth_methods)}{flag}")
     if audit.terrapin_vulnerable:
         lines.append("       [!] Terrapin (CVE-2023-48795): VULNERABLE")
+    lines.extend(_render_pq(audit))
     for finding in audit.weaknesses:
         lines.append(f"       [!] {finding}")
     for note in audit.notes:
         lines.append(f"       note: {note}")
     return lines
+
+
+def _render_pq(audit: SSHAudit) -> list[str]:
+    """Render one service's post-quantum verdict."""
+    if audit.pq_status == PQ_READY:
+        return [f"       post-quantum: ready ({', '.join(audit.pq_kex)})"]
+    if audit.pq_status == PQ_LEGACY:
+        return [
+            "       [!] post-quantum: pre-standard only "
+            f"({', '.join(audit.pq_kex)}); a current client negotiates "
+            "classical crypto"
+        ]
+    if audit.pq_status == PQ_ABSENT:
+        return [
+            "       [!] post-quantum: no PQ key exchange offered; sessions "
+            "are exposed to store-now-decrypt-later capture"
+        ]
+    return []
+
+
+def collect_pq_posture(results: list[HostResult]) -> dict:
+    """Group SSH services by post-quantum readiness across the whole scan.
+
+    Returns ``{status: [socket, ...]}``. The list matters more than the count:
+    the actionable artifact for an estate owner is which services to fix.
+    """
+    posture: dict = defaultdict(list)
+    for result in results:
+        for port in sorted(result.audits):
+            audit = result.audits[port]
+            posture[audit.pq_status].append(f"{result.host}:{port}")
+    return dict(posture)
+
+
+def render_pq_report(results: list[HostResult]) -> str:
+    """Render the fleet-level post-quantum readiness summary."""
+    posture = collect_pq_posture(results)
+    audited = sum(len(sockets) for sockets in posture.values())
+    lines = ["Post-quantum readiness:"]
+    if not audited:
+        lines.append("  no SSH services were audited")
+        return "\n".join(lines)
+
+    exposed = posture.get(PQ_ABSENT, []) + posture.get(PQ_LEGACY, [])
+    ready = posture.get(PQ_READY, [])
+    unknown = posture.get(PQ_UNKNOWN, [])
+    lines.append(
+        f"  {len(ready)}/{audited} service(s) negotiate post-quantum key "
+        "exchange with a current client"
+    )
+    if posture.get(PQ_ABSENT):
+        absent = posture[PQ_ABSENT]
+        lines.append(
+            f"  [!] no PQ key exchange offered ({len(absent)}):"
+        )
+        lines.extend(f"        {sock}" for sock in posture[PQ_ABSENT])
+    if posture.get(PQ_LEGACY):
+        lines.append(
+            f"  [!] pre-standard PQ only ({len(posture[PQ_LEGACY])}) - looks "
+            "post-quantum but is not:"
+        )
+        lines.extend(f"        {sock}" for sock in posture[PQ_LEGACY])
+    if unknown:
+        lines.append(f"  key exchange unreadable ({len(unknown)}):")
+        lines.extend(f"        {sock}" for sock in unknown)
+    if exposed:
+        lines.append(
+            f"  {len(exposed)} service(s) exposed to store-now-decrypt-later "
+            "capture; upgrade to OpenSSH 9.0+ (10.0+ preferred)"
+        )
+    return "\n".join(lines)
 
 
 def render_json(results: list[HostResult]) -> str:
@@ -2127,7 +2278,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--audit",
         action="store_true",
         help="Audit each SSH service: algorithms, host key, auth methods, "
-        "Terrapin (CVE-2023-48795) and shared-host-key correlation.",
+        "Terrapin (CVE-2023-48795), post-quantum readiness and "
+        "shared-host-key correlation.",
+    )
+    parser.add_argument(
+        "--pq-report",
+        action="store_true",
+        help="Report post-quantum key exchange readiness across the estate. "
+        "Reads only the KEXINIT, so it needs no third-party library and "
+        "costs one connection per confirmed SSH service.",
     )
     parser.add_argument(
         "-t",
@@ -2290,11 +2449,16 @@ def run(argv: Optional[list[str]] = None) -> int:
     if args.scan_method == "syn" and not _scapy_available():
         parser.error("syn scan requires the optional 'scapy' dependency")
 
+    # --pq-report needs the KEXINIT but not the Paramiko handshake, so it runs
+    # the audit shallow: dependency-free, and one connection per service
+    # instead of two.
+    audit = args.audit or args.pq_report
+    audit_deep = args.audit
     validate = args.validate
-    if args.audit and validate == "none":
+    if audit and validate == "none":
         # Auditing needs confirmed SSH services to act on.
         validate = "banner"
-        LOGGER.info("--audit requires SSH validation; using 'banner'")
+        LOGGER.info("auditing requires SSH validation; using 'banner'")
 
     LOGGER.info(
         "Scanning %d host(s) x %d port(s) using %s scan "
@@ -2331,7 +2495,8 @@ def run(argv: Optional[list[str]] = None) -> int:
             workers=args.workers,
             retries=args.retries,
             host_concurrency=args.host_concurrency,
-            audit=args.audit,
+            audit=audit,
+            audit_deep=audit_deep,
             progress=reporter,
             stream=stream,
             early_exit=not args.no_early_exit,
@@ -2341,7 +2506,14 @@ def run(argv: Optional[list[str]] = None) -> int:
     finally:
         reporter.finish()
 
-    output = render_json(results) if args.json else render_text(results)
+    if args.json:
+        output = render_json(results)
+    elif args.pq_report and not args.audit:
+        # Asked only for the readiness picture, so give exactly that: a full
+        # per-host listing across an estate would bury it.
+        output = render_pq_report(results)
+    else:
+        output = render_text(results)
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as handle:

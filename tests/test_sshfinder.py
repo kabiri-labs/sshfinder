@@ -606,6 +606,292 @@ class AuditModelTests(unittest.TestCase):
         self.assertIn("aes128-cbc", text)
 
 
+# --------------------------------------------------------------------------- #
+# Post-quantum readiness
+# --------------------------------------------------------------------------- #
+# The standardised hybrid a current OpenSSH client prefers.
+MLKEM = "mlkem768x25519-sha256"
+
+
+def _kex_offering(*algorithms):
+    """A parsed KEXINIT whose server offers exactly ``algorithms``."""
+    return sshfinder.parse_kexinit(
+        build_kexinit_payload(
+            kex=list(algorithms),
+            hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+    )
+
+
+class AssessPostQuantumTests(unittest.TestCase):
+    def test_mlkem_is_ready(self):
+        status, algorithms = sshfinder.assess_post_quantum(
+            _kex_offering("mlkem768x25519-sha256", "curve25519-sha256")
+        )
+        self.assertEqual(status, sshfinder.PQ_READY)
+        self.assertEqual(algorithms, ["mlkem768x25519-sha256"])
+
+    def test_sntrup761_is_ready(self):
+        status, _ = sshfinder.assess_post_quantum(
+            _kex_offering("sntrup761x25519-sha512", "curve25519-sha256")
+        )
+        self.assertEqual(status, sshfinder.PQ_READY)
+
+    def test_openssh_suffixed_spellings_are_ready(self):
+        for name in (
+            "sntrup761x25519-sha512@openssh.com",
+            "mlkem768x25519-sha256@openssh.com",
+        ):
+            with self.subTest(algorithm=name):
+                status, _ = sshfinder.assess_post_quantum(_kex_offering(name))
+                self.assertEqual(status, sshfinder.PQ_READY)
+
+    def test_withdrawn_tinyssh_parameter_set_is_legacy(self):
+        """Looks post-quantum in a dump; a current client gets none."""
+        status, algorithms = sshfinder.assess_post_quantum(
+            _kex_offering(
+                "sntrup4591761x25519-sha512@tinyssh.org", "curve25519-sha256"
+            )
+        )
+        self.assertEqual(status, sshfinder.PQ_LEGACY)
+        self.assertEqual(algorithms, ["sntrup4591761x25519-sha512@tinyssh.org"])
+
+    def test_kyber_drafts_are_legacy(self):
+        for name in (
+            "x25519-kyber-512r3-sha256-d00@amazon.com",
+            "ecdh-nistp256-kyber-512r3-sha256-d00",
+        ):
+            with self.subTest(algorithm=name):
+                status, _ = sshfinder.assess_post_quantum(_kex_offering(name))
+                self.assertEqual(status, sshfinder.PQ_LEGACY)
+
+    def test_standard_alongside_draft_is_ready(self):
+        """One usable hybrid is enough, whatever else is on offer."""
+        status, algorithms = sshfinder.assess_post_quantum(
+            _kex_offering(
+                "sntrup4591761x25519-sha512@tinyssh.org",
+                "mlkem768x25519-sha256",
+            )
+        )
+        self.assertEqual(status, sshfinder.PQ_READY)
+        self.assertEqual(len(algorithms), 2)
+
+    def test_classical_only_is_absent(self):
+        status, algorithms = sshfinder.assess_post_quantum(
+            _kex_offering("curve25519-sha256", "ecdh-sha2-nistp256")
+        )
+        self.assertEqual(status, sshfinder.PQ_ABSENT)
+        self.assertEqual(algorithms, [])
+
+    def test_unknown_vendor_hybrid_is_not_reported_as_absent(self):
+        """A future spelling must not be mistaken for having no PQ at all."""
+        status, _ = sshfinder.assess_post_quantum(
+            _kex_offering("mlkem1024nistp384-sha384", "curve25519-sha256")
+        )
+        self.assertEqual(status, sshfinder.PQ_LEGACY)
+
+    def test_case_is_ignored(self):
+        status, _ = sshfinder.assess_post_quantum(
+            _kex_offering("ECDH-NISTP256-KYBER-512R3-SHA256-D00")
+        )
+        self.assertEqual(status, sshfinder.PQ_LEGACY)
+
+    def test_unreadable_kexinit_claims_nothing(self):
+        for kex in (None, {}, {"kex": []}):
+            with self.subTest(kex=kex):
+                status, algorithms = sshfinder.assess_post_quantum(kex)
+                self.assertEqual(status, sshfinder.PQ_UNKNOWN)
+                self.assertEqual(algorithms, [])
+
+
+class PostQuantumAuditTests(unittest.TestCase):
+    """End to end: KEXINIT on the wire through to the audit verdict."""
+
+    def _audit_offering(self, algorithms):
+        payload = build_kexinit_payload(
+            kex=algorithms,
+            hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+
+        def serve(conn):
+            conn.sendall(b"SSH-2.0-FakeServer_1.0\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        with LoopbackServer(serve) as server:
+            return sshfinder.audit_ssh_service(
+                "127.0.0.1", server.port, 2.0, deep=False
+            )
+
+    def test_ready_server(self):
+        audit = self._audit_offering(
+            ["mlkem768x25519-sha256", "curve25519-sha256"]
+        )
+        self.assertEqual(audit.pq_status, sshfinder.PQ_READY)
+        self.assertEqual(audit.pq_kex, ["mlkem768x25519-sha256"])
+
+    def test_absent_server(self):
+        audit = self._audit_offering(["curve25519-sha256"])
+        self.assertEqual(audit.pq_status, sshfinder.PQ_ABSENT)
+
+    def test_shallow_audit_needs_no_paramiko(self):
+        """The PQ verdict comes from the KEXINIT, so no dependency is needed."""
+        audit = self._audit_offering(["mlkem768x25519-sha256"])
+        self.assertEqual(audit.pq_status, sshfinder.PQ_READY)
+        self.assertEqual(audit.host_key_fingerprint, "")  # Deep probe skipped.
+        self.assertEqual(audit.notes, [])
+
+    def test_unreachable_service_stays_unknown(self):
+        audit = sshfinder.audit_ssh_service("127.0.0.1", 1, 0.5, deep=False)
+        self.assertEqual(audit.pq_status, sshfinder.PQ_UNKNOWN)
+
+    def test_audit_dict_carries_the_verdict(self):
+        audit = self._audit_offering(["mlkem768x25519-sha256"])
+        payload = audit.as_dict()
+        self.assertEqual(payload["pq_status"], sshfinder.PQ_READY)
+        self.assertEqual(payload["pq_kex"], ["mlkem768x25519-sha256"])
+
+
+class PostQuantumRenderTests(unittest.TestCase):
+    def _result(self, host, port, status, algorithms=()):
+        audit = sshfinder.SSHAudit(
+            host=host, port=port, pq_status=status, pq_kex=list(algorithms)
+        )
+        return sshfinder.HostResult(
+            host=host, open_ports=[port], ssh_ports=[port], audits={port: audit}
+        )
+
+    def test_service_line_states_readiness(self):
+        text = sshfinder.render_text([
+            self._result("10.0.0.1", 22, sshfinder.PQ_READY,
+                         ["mlkem768x25519-sha256"])
+        ])
+        self.assertIn("post-quantum: ready", text)
+        self.assertIn("mlkem768x25519-sha256", text)
+
+    def test_service_line_flags_absence(self):
+        text = sshfinder.render_text([
+            self._result("10.0.0.1", 22, sshfinder.PQ_ABSENT)
+        ])
+        self.assertIn("no PQ key exchange offered", text)
+        self.assertIn("store-now-decrypt-later", text)
+
+    def test_service_line_explains_pre_standard(self):
+        text = sshfinder.render_text([
+            self._result("10.0.0.1", 22, sshfinder.PQ_LEGACY,
+                         ["sntrup4591761x25519-sha512@tinyssh.org"])
+        ])
+        self.assertIn("pre-standard only", text)
+        self.assertIn("negotiates classical crypto", text)
+
+    def test_unknown_verdict_claims_nothing_per_service(self):
+        audit = sshfinder.SSHAudit(
+            host="10.0.0.1", port=22, pq_status=sshfinder.PQ_UNKNOWN
+        )
+        self.assertEqual(sshfinder._render_pq(audit), [])
+
+    def test_posture_groups_every_service(self):
+        posture = sshfinder.collect_pq_posture([
+            self._result("10.0.0.1", 22, sshfinder.PQ_READY, [MLKEM]),
+            self._result("10.0.0.2", 22, sshfinder.PQ_ABSENT),
+            self._result("10.0.0.3", 2222, sshfinder.PQ_LEGACY, ["draft"]),
+        ])
+        self.assertEqual(posture[sshfinder.PQ_READY], ["10.0.0.1:22"])
+        self.assertEqual(posture[sshfinder.PQ_ABSENT], ["10.0.0.2:22"])
+        self.assertEqual(posture[sshfinder.PQ_LEGACY], ["10.0.0.3:2222"])
+
+    def test_fleet_report_counts_and_lists_the_exposed(self):
+        report = sshfinder.render_pq_report([
+            self._result("10.0.0.1", 22, sshfinder.PQ_READY, [MLKEM]),
+            self._result("10.0.0.2", 22, sshfinder.PQ_ABSENT),
+            self._result("10.0.0.3", 22, sshfinder.PQ_LEGACY, ["kyber-draft"]),
+        ])
+        self.assertIn("1/3 service(s) negotiate post-quantum", report)
+        self.assertIn("10.0.0.2:22", report)
+        self.assertIn("10.0.0.3:22", report)
+        # Exposed counts the absent and the pre-standard together.
+        self.assertIn("2 service(s) exposed", report)
+
+    def test_fleet_report_is_quiet_when_all_ready(self):
+        report = sshfinder.render_pq_report([
+            self._result("10.0.0.1", 22, sshfinder.PQ_READY, [MLKEM])
+        ])
+        self.assertIn("1/1", report)
+        self.assertNotIn("exposed", report)
+
+    def test_fleet_report_without_audits(self):
+        report = sshfinder.render_pq_report([sshfinder.HostResult(host="h")])
+        self.assertIn("no SSH services were audited", report)
+
+    def test_unaudited_scan_shows_no_pq_block(self):
+        text = sshfinder.render_text([
+            sshfinder.HostResult(host="h", open_ports=[22], ssh_ports=[22])
+        ])
+        self.assertNotIn("Post-quantum readiness", text)
+
+
+class PostQuantumCLITests(unittest.TestCase):
+    def _serve_pq(self, algorithms):
+        payload = build_kexinit_payload(
+            kex=algorithms,
+            hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+
+        def serve(conn):
+            conn.sendall(b"SSH-2.0-FakeServer_1.0\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        return serve
+
+    def test_flag_defaults_off(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertFalse(args.pq_report)
+
+    def test_pq_report_prints_only_the_readiness_view(self):
+        with LoopbackServer(self._serve_pq(["curve25519-sha256"])) as server:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = sshfinder.run(
+                    ["127.0.0.1", "-p", str(server.port), "--pq-report", "-q"]
+                )
+        self.assertEqual(exit_code, 0)
+        report = stdout.getvalue()
+        self.assertIn("Post-quantum readiness:", report)
+        self.assertIn("no PQ key exchange offered", report)
+        # The full per-host listing would bury the answer across an estate.
+        self.assertNotIn("=== 127.0.0.1 ===", report)
+
+    def test_pq_report_json_carries_the_verdict(self):
+        with LoopbackServer(self._serve_pq([MLKEM])) as server:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                sshfinder.run(
+                    ["127.0.0.1", "-p", str(server.port), "--pq-report",
+                     "--json", "-q"]
+                )
+            parsed = json.loads(stdout.getvalue())
+        audit = parsed[0]["audit"][str(server.port)]
+        self.assertEqual(audit["pq_status"], sshfinder.PQ_READY)
+
+    def test_pq_report_forces_validation_on(self):
+        """--validate none would leave nothing to audit."""
+        with LoopbackServer(self._serve_pq([MLKEM])) as server:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                sshfinder.run(
+                    ["127.0.0.1", "-p", str(server.port), "--pq-report",
+                     "--validate", "none", "-q"]
+                )
+        self.assertIn("1/1", stdout.getvalue())
+
+
 class LiveKexinitTests(unittest.TestCase):
     def test_read_server_kexinit_live(self):
         """End-to-end raw KEXINIT read against a fake server."""
