@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.5.0-blue)
+![version](https://img.shields.io/badge/version-2.6.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -43,6 +43,14 @@ speed.
   and flags weak/deprecated ones, detects **Terrapin (CVE-2023-48795)**, and
   **correlates shared host keys** across targets to reveal cloned or
   load-balanced infrastructure.
+- **Post-quantum readiness (`--pq-report`)** — one number for the estate: how
+  many SSH services still cannot negotiate post-quantum key exchange, and
+  exactly which ones. OpenSSH 10.0 made `mlkem768x25519-sha256` the default
+  and 10.1 warns that classical sessions are open to *store now, decrypt
+  later* capture. Reads only the KEXINIT, so it needs no third-party library.
+  It also separates services offering **pre-standard** hybrids (the withdrawn
+  `sntrup4591761`, Kyber drafts) — these look post-quantum in an algorithm
+  dump but negotiate classical crypto with every current client.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
 - **Bounded by design** — a process-wide socket budget derived from the
@@ -107,7 +115,8 @@ python sshfinder.py [targets ...] [options]
 | `-p, --ports SPEC` | Ports to scan, e.g. `22,80,1000-2000` (default: `1-65535`). |
 | `--scan-method {auto,connect,syn}` | Scan back-end (default: `auto`). |
 | `--validate {banner,paramiko,none}` | SSH validation strategy (default: `banner`). |
-| `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, shared-key correlation). |
+| `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, post-quantum readiness, shared-key correlation). |
+| `--pq-report` | Report post-quantum key exchange readiness across the estate. Reads only the KEXINIT — no third-party library needed. |
 | `-t, --timeout SECONDS` | Longest a probe may wait (default: `2.0`). |
 | `--min-timeout SECONDS` | Floor for the adaptive probe timeout (default: `0.1`). |
 | `--no-adaptive-timeout` | Wait the full `--timeout` on every probe instead of adapting to the measured round-trip time. |
@@ -189,6 +198,22 @@ Terrapin, shared host keys):
 
 ```bash
 python sshfinder.py 10.0.0.0/24 -p 22,2222 --audit
+```
+
+Check post-quantum readiness across an estate (no dependencies required):
+
+```bash
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --pq-report
+```
+
+```
+Post-quantum readiness:
+  1/3 service(s) negotiate post-quantum key exchange with a current client
+  [!] no PQ key exchange offered (1):
+        10.0.0.2:22
+  [!] pre-standard PQ only (1) - looks post-quantum but is not:
+        10.0.0.3:22
+  2 service(s) exposed to store-now-decrypt-later capture; upgrade to OpenSSH 9.0+ (10.0+ preferred)
 ```
 
 Example audit output:
