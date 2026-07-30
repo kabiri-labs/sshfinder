@@ -1,2 +1,3 @@
+# The test suite runs on the standard library alone; the runtime deps below
+# additionally enable the Paramiko-backed audit tests, which skip without them.
 -r requirements.txt
-pytest>=7.0

@@ -46,7 +46,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 LOGGER = logging.getLogger("sshfinder")
 

@@ -15,7 +15,10 @@ Thank you for considering contributing to SSHfinder! To ensure a smooth collabor
 
 - Use `PEP 8` conventions for Python code.
 - Keep line lengths under 80 characters.
-- Ensure all tests pass before submitting your PR.
+- Ensure all tests pass before submitting your PR:
+  `python -m unittest discover -s tests`
+- Tests must run on the standard library alone; keep new tests dependency-free
+  (skip rather than fail when an optional dependency is missing).
 
 ## Issues
 
