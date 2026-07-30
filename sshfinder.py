@@ -48,13 +48,14 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
 # Defaults chosen to be safe and reasonably fast on typical networks.
 DEFAULT_PORTS = "1-65535"
 DEFAULT_TIMEOUT = 2.0
+DEFAULT_MIN_TIMEOUT = 0.1
 DEFAULT_WORKERS = 512
 DEFAULT_RETRIES = 0
 DEFAULT_HOST_CONCURRENCY = 16
@@ -89,6 +90,13 @@ WINDOWS_SOCKET_BUDGET = 400
 # range is firewalled or down, and sweeping the rest buys nothing.
 EARLY_EXIT_MIN_PORTS = 1024
 EARLY_EXIT_PROBES = 256
+
+# Smoothed round-trip estimator constants, per RFC 6298 (Jacobson-Karels):
+# alpha and beta weight each new sample into the mean and the deviation, and
+# the timeout allows K deviations of slack above the mean.
+RTT_ALPHA = 0.125
+RTT_BETA = 0.25
+RTT_VARIANCE_FACTOR = 4
 
 # SSH binary protocol constants (RFC 4253).
 SSH_MSG_KEXINIT = 20
@@ -175,6 +183,7 @@ class HostResult:
     filtered: int = 0
     service_checked: bool = False
     early_exit: bool = False
+    rtt_ms: Optional[float] = None
     error: Optional[str] = None
 
     @property
@@ -197,6 +206,7 @@ class HostResult:
             "service_checked": self.service_checked,
             "responsive": self.responsive,
             "early_exit": self.early_exit,
+            "rtt_ms": self.rtt_ms,
             "error": self.error,
         }
 
@@ -607,6 +617,95 @@ def configure_socket_budget(capacity: int) -> SocketBudget:
         return _SHARED_BUDGET
 
 
+class AdaptiveTimeout:
+    """Probe timeout derived from the round trips a path actually shows.
+
+    A fixed two-second timeout is wrong in both directions: wasteful on a LAN
+    where every answer lands in under a millisecond, and too tight over a slow
+    link. This tracks the smoothed round-trip time and its variance with the
+    estimator from RFC 6298 -- the one TCP itself uses to set retransmission
+    timeouts -- and allows ``srtt + 4 * rttvar`` before giving up on a probe.
+
+    Only a definite answer, a SYN/ACK or a RST, measures anything. A timeout
+    teaches nothing about the path and is deliberately never fed back in,
+    which is what keeps the estimate from ratcheting itself upward.
+
+    ``--timeout`` remains the ceiling, so no probe ever waits longer than the
+    user asked for, and ``floor`` keeps a fast local path from tightening the
+    timeout to the point where ordinary scheduling jitter looks like loss.
+
+    Estimators are per-host, since round-trip time is a property of the path.
+    ``pool`` links one to the estimate shared by the whole scan, which is what
+    lets short per-host sweeps -- ``-p 22`` across a subnet, where no single
+    host ever collects enough answers to tune itself -- converge at all: every
+    host starts from what the others have already measured.
+    """
+
+    def __init__(
+        self,
+        ceiling: float,
+        floor: float = DEFAULT_MIN_TIMEOUT,
+        enabled: bool = True,
+        pool: Optional["AdaptiveTimeout"] = None,
+    ):
+        self.ceiling = max(0.001, ceiling)
+        self.floor = min(max(0.001, floor), self.ceiling)
+        self.enabled = enabled
+        self._pool = pool
+        self._lock = threading.Lock()
+        self._srtt: Optional[float] = None
+        self._rttvar = 0.0
+        if pool is not None:
+            seed = pool.snapshot()
+            if seed is not None:
+                self._srtt, self._rttvar = seed
+
+    def derive(self) -> "AdaptiveTimeout":
+        """A per-host estimator seeded from, and reporting back to, this one."""
+        return AdaptiveTimeout(
+            self.ceiling, floor=self.floor, enabled=self.enabled, pool=self
+        )
+
+    def snapshot(self) -> Optional[tuple]:
+        """``(srtt, rttvar)`` so far, or None if nothing has been measured."""
+        with self._lock:
+            if self._srtt is None:
+                return None
+            return self._srtt, self._rttvar
+
+    @property
+    def rtt(self) -> Optional[float]:
+        """Smoothed round-trip time in seconds, or None if never measured."""
+        with self._lock:
+            return self._srtt
+
+    def observe(self, rtt: float) -> None:
+        """Fold one measured round trip into the estimate."""
+        rtt = min(max(rtt, 0.0), self.ceiling)
+        with self._lock:
+            if self._srtt is None:
+                self._srtt = rtt
+                self._rttvar = rtt / 2.0
+            else:
+                self._rttvar = (
+                    (1 - RTT_BETA) * self._rttvar
+                    + RTT_BETA * abs(self._srtt - rtt)
+                )
+                self._srtt = (1 - RTT_ALPHA) * self._srtt + RTT_ALPHA * rtt
+        if self._pool is not None:
+            self._pool.observe(rtt)
+
+    def value(self) -> float:
+        """How long the next probe should wait for an answer."""
+        if not self.enabled:
+            return self.ceiling
+        with self._lock:
+            if self._srtt is None:
+                return self.ceiling
+            estimate = self._srtt + RTT_VARIANCE_FACTOR * self._rttvar
+        return min(self.ceiling, max(self.floor, estimate))
+
+
 def order_ports(ports: Iterable[int]) -> list[int]:
     """Order a port list so SSH's usual homes are probed first.
 
@@ -630,12 +729,17 @@ def _classify_connect_errno(code: int) -> str:
 
 @dataclass
 class _Probe:
-    """One connect() in flight."""
+    """One connect() in flight.
+
+    Only the issue time is recorded, never a fixed deadline: the timeout is
+    re-read from the estimator on every check, so a probe issued while the
+    estimate was pessimistic stops waiting as soon as the path proves fast.
+    """
 
     port: int
     fd: int
     sock: socket.socket
-    deadline: float
+    start: float
     done: bool = False
 
 
@@ -648,6 +752,7 @@ class _SweepOutcome:
     filtered: int = 0
     probed: int = 0
     unresponsive: bool = False
+    rtt: Optional[float] = None
 
 
 class _UnresponsiveGate:
@@ -688,7 +793,7 @@ def _sweep_pass(
     endpoint: _Endpoint,
     ports: list[int],
     *,
-    timeout: float,
+    timer: AdaptiveTimeout,
     max_inflight: int,
     budget: SocketBudget,
     on_result: Callable[[int, str, Optional[socket.socket]], bool],
@@ -697,6 +802,11 @@ def _sweep_pass(
     should_abort: Optional[Callable[[], bool]] = None,
 ) -> tuple[list[int], list[int]]:
     """Probe every port in ``ports`` once, driving all sockets from one thread.
+
+    ``timer`` supplies how long to wait for an answer and is fed every round
+    trip that produced one, so the sweep tightens itself as it learns the
+    path. Because all in-flight probes share whatever the current estimate is,
+    issue order stays deadline order and expiry remains a queue walk.
 
     ``on_result`` receives ``(port, status, socket_or_None)`` and returns True
     if it has taken ownership of a connected socket -- which lets the caller
@@ -759,8 +869,7 @@ def _sweep_pass(
                     budget.release()
                     continue
                 if code in _INPROGRESS_ERRNOS:
-                    probe = _Probe(port, sock.fileno(), sock,
-                                   time.monotonic() + timeout)
+                    probe = _Probe(port, sock.fileno(), sock, time.monotonic())
                     live[probe.fd] = probe
                     expiry.append(probe)
                     selector.register(sock, selectors.EVENT_WRITE, probe)
@@ -781,9 +890,9 @@ def _sweep_pass(
                 expiry.popleft()
             wait_for = POLL_INTERVAL
             if expiry:
+                oldest = expiry[0].start + timer.value()
                 wait_for = min(
-                    POLL_INTERVAL,
-                    max(0.0, expiry[0].deadline - time.monotonic()),
+                    POLL_INTERVAL, max(0.0, oldest - time.monotonic())
                 )
             for key, _ in selector.select(timeout=wait_for):
                 probe = key.data
@@ -794,6 +903,10 @@ def _sweep_pass(
                     )
                 except OSError as exc:  # pragma: no cover - defensive
                     code = exc.errno or 0
+                if code == 0 or code in _CLOSED_ERRNOS:
+                    # A SYN/ACK or a RST is a completed round trip, and the
+                    # only kind of answer that says anything about the path.
+                    timer.observe(time.monotonic() - probe.start)
                 if code == 0:
                     if not on_result(probe.port, OPEN, probe.sock):
                         probe.sock.close()
@@ -802,9 +915,10 @@ def _sweep_pass(
                     on_result(probe.port, _classify_connect_errno(code), None)
                 budget.release()
 
-            # 3. Expire probes that never answered.
+            # 3. Expire probes that have waited out the current estimate.
             now = time.monotonic()
-            while expiry and (expiry[0].done or expiry[0].deadline <= now):
+            limit = timer.value()
+            while expiry and (expiry[0].done or expiry[0].start + limit <= now):
                 probe = expiry.popleft()
                 if probe.done:
                     continue
@@ -843,14 +957,20 @@ def _connect_sweep(
     on_open: Optional[Callable[[int, Optional[socket.socket]], bool]] = None,
     budget: Optional[SocketBudget] = None,
     early_exit: bool = True,
+    timer: Optional[AdaptiveTimeout] = None,
 ) -> _SweepOutcome:
-    """Sweep one host's ports, reporting each verdict as it lands."""
+    """Sweep one host's ports, reporting each verdict as it lands.
+
+    ``timeout`` is the ceiling; ``timer`` decides how much of it each probe
+    actually waits. Without one, a fresh per-host estimator is used.
+    """
     outcome = _SweepOutcome()
     if not ports:
         return outcome
 
     endpoint = resolve_endpoint(host)
     budget = budget if budget is not None else shared_socket_budget()
+    timer = timer if timer is not None else AdaptiveTimeout(timeout)
     queue = order_ports(ports)
     priority = {p for p in SSH_PRIORITY_PORTS if p in set(queue)}
     # Priority ports that answered nothing -- the only ones worth a retry.
@@ -886,7 +1006,7 @@ def _connect_sweep(
         timed_out, unresolved = _sweep_pass(
             endpoint,
             queue,
-            timeout=timeout,
+            timer=timer,
             max_inflight=max_inflight,
             budget=budget,
             on_result=record,
@@ -918,6 +1038,7 @@ def _connect_sweep(
         on_open=on_open,
     )
     outcome.open_ports.sort()
+    outcome.rtt = timer.rtt
     return outcome
 
 
@@ -940,6 +1061,11 @@ def _reprobe_ssh_ports(
     finding, and at high concurrency it does happen. Re-probing this handful
     is bounded by a single timeout, so the accuracy is close to free -- unlike
     a blanket ``--retries``, which doubles the cost of the whole sweep.
+
+    This last chance deliberately waits out the full ``--timeout`` rather than
+    the tightened estimate: an adaptive timeout is a throughput optimisation,
+    and the one place not to spend accuracy on throughput is the final look at
+    the ports the tool exists to find.
     """
     if not candidates or (stop_event is not None and stop_event.is_set()):
         return
@@ -962,7 +1088,7 @@ def _reprobe_ssh_ports(
     _sweep_pass(
         endpoint,
         candidates,
-        timeout=timeout,
+        timer=AdaptiveTimeout(timeout, enabled=False),
         max_inflight=max(1, min(len(candidates), budget.capacity)),
         budget=budget,
         on_result=record,
@@ -982,6 +1108,8 @@ def connect_scan_host(
     *,
     budget: Optional[SocketBudget] = None,
     early_exit: bool = True,
+    adaptive: bool = True,
+    min_timeout: float = DEFAULT_MIN_TIMEOUT,
 ) -> tuple[list[int], int, int]:
     """Non-blocking TCP connect scan of a single host.
 
@@ -989,6 +1117,10 @@ def connect_scan_host(
     ceiling is the process-wide :class:`SocketBudget`. All of them are driven
     from one thread by a selector, so concurrency costs a file descriptor
     rather than an OS thread.
+
+    ``timeout`` is the longest a probe may wait. Unless ``adaptive`` is off,
+    probes wait only as long as the host's measured round-trip time warrants,
+    down to ``min_timeout``.
 
     Returns ``(open_ports, closed_count, filtered_count)``. Open ports are
     reported live through ``progress`` and handed to ``on_open`` the instant
@@ -1006,6 +1138,7 @@ def connect_scan_host(
         on_open=(lambda port, _sock: bool(on_open(port))) if on_open else None,
         budget=budget,
         early_exit=early_exit,
+        timer=AdaptiveTimeout(timeout, floor=min_timeout, enabled=adaptive),
     )
     return outcome.open_ports, outcome.closed, outcome.filtered
 
@@ -1538,6 +1671,7 @@ def scan_host(
     stream: Optional[EventStream] = None,
     budget: Optional[SocketBudget] = None,
     early_exit: bool = True,
+    rtt_pool: Optional[AdaptiveTimeout] = None,
 ) -> HostResult:
     """Scan a single host, identifying the service behind each open port as
     soon as it is discovered.
@@ -1547,6 +1681,12 @@ def scan_host(
     pool -- along with the socket that discovered it, so identification costs
     no second handshake -- and SSH services are confirmed while the rest of
     the port range is still being swept.
+
+    ``rtt_pool`` shares round-trip knowledge with the rest of the scan; this
+    host derives its own estimator from it. Note that only port discovery
+    adapts: the banner exchange and the audit keep the full ``timeout``,
+    because how quickly a host completes a TCP handshake says nothing about
+    how quickly its SSH daemon composes a greeting.
     """
     result = HostResult(host=host)
     result.service_checked = validate != "none"
@@ -1593,11 +1733,14 @@ def scan_host(
                 on_open=handle_open,
                 budget=budget,
                 early_exit=early_exit,
+                timer=rtt_pool.derive() if rtt_pool is not None else None,
             )
             result.open_ports = outcome.open_ports
             result.closed = outcome.closed
             result.filtered = outcome.filtered
             result.early_exit = outcome.unresponsive
+            if outcome.rtt is not None:
+                result.rtt_ms = round(outcome.rtt * 1000, 3)
     except Exception as exc:
         result.error = str(exc)
         LOGGER.debug("scan of %s failed: %s", host, exc)
@@ -1716,6 +1859,8 @@ def scan_targets(
     progress: Optional[ProgressReporter] = None,
     stream: Optional[EventStream] = None,
     early_exit: bool = True,
+    adaptive_timeout: bool = True,
+    min_timeout: float = DEFAULT_MIN_TIMEOUT,
 ) -> list[HostResult]:
     """Scan many hosts concurrently and return their results.
 
@@ -1745,6 +1890,12 @@ def scan_targets(
 
     results_map: dict[str, HostResult] = {}
     budget = shared_socket_budget()
+    # One pool of round-trip knowledge for the whole scan; each host derives
+    # its own estimator from it, so later hosts start from what earlier ones
+    # measured instead of every host relearning the network from scratch.
+    rtt_pool = AdaptiveTimeout(
+        timeout, floor=min_timeout, enabled=adaptive_timeout
+    )
     pool_size = max(1, min(host_concurrency, len(hosts)))
     executor = ThreadPoolExecutor(max_workers=pool_size)
     futures = {
@@ -1763,6 +1914,7 @@ def scan_targets(
             stream=stream,
             budget=budget,
             early_exit=early_exit,
+            rtt_pool=rtt_pool,
         ): host
         for host in hosts
     }
@@ -1982,7 +2134,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
-        help=f"Per-connection timeout in seconds (default: {DEFAULT_TIMEOUT}).",
+        help="Longest a probe may wait, in seconds "
+        f"(default: {DEFAULT_TIMEOUT}).",
+    )
+    parser.add_argument(
+        "--min-timeout",
+        type=float,
+        default=DEFAULT_MIN_TIMEOUT,
+        help="Floor for the adaptive probe timeout "
+        f"(default: {DEFAULT_MIN_TIMEOUT}).",
+    )
+    parser.add_argument(
+        "--no-adaptive-timeout",
+        action="store_true",
+        help="Wait the full --timeout on every probe instead of adapting it "
+        "to the measured round-trip time.",
     )
     parser.add_argument(
         "-w",
@@ -2100,6 +2266,10 @@ def run(argv: Optional[list[str]] = None) -> int:
         parser.error("retries must be >= 0")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.min_timeout <= 0:
+        parser.error("min-timeout must be positive")
+    if args.min_timeout > args.timeout:
+        parser.error("min-timeout cannot exceed timeout")
     if args.max_targets < 1:
         parser.error("max-targets must be >= 1")
     if args.max_sockets < 0:
@@ -2165,6 +2335,8 @@ def run(argv: Optional[list[str]] = None) -> int:
             progress=reporter,
             stream=stream,
             early_exit=not args.no_early_exit,
+            adaptive_timeout=not args.no_adaptive_timeout,
+            min_timeout=args.min_timeout,
         )
     finally:
         reporter.finish()

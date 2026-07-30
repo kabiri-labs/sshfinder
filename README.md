@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.4.0-blue)
+![version](https://img.shields.io/badge/version-2.5.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -20,6 +20,12 @@ speed.
 - **SSH ports first** — the handful of ports SSH actually lives on (22, 2222,
   22222, …) are probed at the head of every sweep, so a service is usually
   confirmed in well under a second even when the scan covers all 65535 ports.
+- **Adaptive timeout** — probes wait as long as the path actually warrants,
+  not a flat two seconds. The smoothed round-trip estimator from RFC 6298 —
+  the one TCP itself uses — is fed by every answered probe and shared across
+  the scan, so `--timeout` becomes a ceiling rather than a fixed cost. On a
+  live-but-mostly-filtered host this is worth ~5× (34s → 6s over 8000 ports)
+  with identical findings; `--no-adaptive-timeout` restores the flat wait.
 - **Two scan back-ends**:
   - `connect` — portable TCP connect scan, no privileges required (default).
   - `syn` — half-open SYN scan via Scapy (faster, requires root).
@@ -102,7 +108,9 @@ python sshfinder.py [targets ...] [options]
 | `--scan-method {auto,connect,syn}` | Scan back-end (default: `auto`). |
 | `--validate {banner,paramiko,none}` | SSH validation strategy (default: `banner`). |
 | `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, shared-key correlation). |
-| `-t, --timeout SECONDS` | Per-connection timeout (default: `2.0`). |
+| `-t, --timeout SECONDS` | Longest a probe may wait (default: `2.0`). |
+| `--min-timeout SECONDS` | Floor for the adaptive probe timeout (default: `0.1`). |
+| `--no-adaptive-timeout` | Wait the full `--timeout` on every probe instead of adapting to the measured round-trip time. |
 | `-w, --workers N` | Connections in flight per host (default: `512`). |
 | `--max-sockets N` | Ceiling on probe sockets open at once across the whole scan (default: derived from the file-descriptor limit). |
 | `--host-concurrency N` | Hosts scanned in parallel (default: `16`). |
@@ -117,12 +125,19 @@ python sshfinder.py [targets ...] [options]
 | `-q, --quiet` | Suppress progress and informational logging. |
 
 > **Note on slow scans.** A full `1-65535` sweep of a firewalled host still
-> has to wait out a timeout per filtered port. Three things keep that from
+> has to wait out a timeout per filtered port. Four things keep that from
 > hurting: SSH's own ports are probed first, so a live service surfaces
-> immediately; a host that answers nothing at all is abandoned after a few
+> immediately; the timeout shrinks to whatever the host's measured round-trip
+> time warrants; a host that answers nothing at all is abandoned after a few
 > hundred silent probes; and `--stream` delivers each result as it lands. To
-> go faster still, narrow the ports (`-p 22,2222`) or lower the timeout
+> go faster still, narrow the ports (`-p 22,2222`) or lower the ceiling
 > (`-t 1`).
+>
+> The adaptive timeout only governs port discovery. The banner exchange and
+> `--audit` always get the full `--timeout`, because how fast a host completes
+> a TCP handshake says nothing about how fast its SSH daemon answers. The
+> ports SSH usually lives on also get one final probe at the full ceiling
+> before being reported filtered.
 >
 > `-w` bounds the connections one host keeps in flight, but the real ceiling
 > is `--max-sockets`, derived from the process file-descriptor limit and
