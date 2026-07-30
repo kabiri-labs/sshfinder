@@ -25,18 +25,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import ipaddress
 import json
 import logging
 import os
+import selectors
 import signal
 import socket
 import struct
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
@@ -46,16 +48,17 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
 # Defaults chosen to be safe and reasonably fast on typical networks.
 DEFAULT_PORTS = "1-65535"
 DEFAULT_TIMEOUT = 2.0
-DEFAULT_WORKERS = 200
+DEFAULT_WORKERS = 512
 DEFAULT_RETRIES = 0
 DEFAULT_HOST_CONCURRENCY = 16
+DEFAULT_MAX_TARGETS = 65536
 MAX_PORT = 65535
 SSH_BANNER_PREFIX = b"SSH-"
 # Identification string we present when probing, per RFC 4253.
@@ -70,8 +73,32 @@ OPEN = "open"
 CLOSED = "closed"
 FILTERED = "filtered"
 
+# Ports SSH actually tends to live on. Probing these first means a service is
+# usually confirmed within milliseconds even when the sweep covers all 65535.
+SSH_PRIORITY_PORTS = (22, 2222, 22222, 2022, 2200, 22022, 8022, 830)
+
+# Ceiling on probe sockets held open at once. The real limit is the process
+# file-descriptor allowance; this bounds it on systems with a generous one.
+MAX_SOCKET_BUDGET = 8192
+# File descriptors left for stdio, DNS, and the assessment stage.
+SOCKET_BUDGET_HEADROOM = 128
+# Windows select() is bounded by FD_SETSIZE (512); stay clear of it.
+WINDOWS_SOCKET_BUDGET = 400
+
+# A host that answers nothing at all across this many probes of a large port
+# range is firewalled or down, and sweeping the rest buys nothing.
+EARLY_EXIT_MIN_PORTS = 1024
+EARLY_EXIT_PROBES = 256
+
 # SSH binary protocol constants (RFC 4253).
 SSH_MSG_KEXINIT = 20
+# RFC 4253 section 4.2 lets a server send arbitrary lines before its
+# identification string; bound how much of that preamble we will read.
+MAX_PREAMBLE_LINES = 20
+MAX_IDENT_LINE = 1024
+MAX_SSH_PACKET = 200_000
+# Ports per Scapy send/receive batch, so a SYN scan stays interruptible.
+SYN_CHUNK_SIZE = 1024
 # Username presented for the unauthenticated "none" auth probe used to
 # enumerate the methods a server will accept. It is not expected to succeed.
 AUTH_PROBE_USER = "sshfinder"
@@ -147,6 +174,7 @@ class HostResult:
     closed: int = 0
     filtered: int = 0
     service_checked: bool = False
+    early_exit: bool = False
     error: Optional[str] = None
 
     @property
@@ -168,8 +196,44 @@ class HostResult:
             "filtered": self.filtered,
             "service_checked": self.service_checked,
             "responsive": self.responsive,
+            "early_exit": self.early_exit,
             "error": self.error,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Streaming events
+# --------------------------------------------------------------------------- #
+class EventStream:
+    """Newline-delimited JSON events, flushed the instant something is found.
+
+    A long sweep otherwise produces nothing machine-readable until it ends.
+    Streaming lets a pipeline act on the first confirmed SSH service while the
+    rest of the scan is still running.
+    """
+
+    def __init__(self, stream, enabled: bool = True):
+        self._stream = stream
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+
+    def emit(self, event: str, **fields) -> None:
+        if not self.enabled:
+            return
+        record = {
+            "event": event,
+            "elapsed": round(time.monotonic() - self._start, 3),
+        }
+        record.update(fields)
+        line = json.dumps(record)
+        with self._lock:
+            try:
+                self._stream.write(line + "\n")
+                self._stream.flush()
+            except (OSError, ValueError):
+                # A closed or broken pipe must not abort an in-flight scan.
+                self.enabled = False
 
 
 # --------------------------------------------------------------------------- #
@@ -292,13 +356,26 @@ def _validate_port(port: int) -> None:
         raise ValueError(f"port out of range (1-{MAX_PORT}): {port}")
 
 
-def expand_targets(targets: Iterable[str]) -> list[str]:
+def expand_targets(
+    targets: Iterable[str], max_targets: int = DEFAULT_MAX_TARGETS
+) -> list[str]:
     """Expand a collection of target tokens into a de-duplicated, ordered list
     of host strings.
 
     Each token may be an IP address, a hostname, or a CIDR network such as
     ``10.0.0.0/24`` (which is expanded into individual host addresses).
+
+    ``max_targets`` bounds the expansion. Without it a stray ``/8`` -- or any
+    IPv6 prefix wider than a ``/112`` -- would try to materialise millions of
+    addresses and exhaust memory before a single packet was sent.
+
+    Raises:
+        ValueError: on a malformed token, an empty result, or an expansion
+            that would exceed ``max_targets``.
     """
+    if max_targets < 1:
+        raise ValueError("max_targets must be >= 1")
+
     expanded: list[str] = []
     seen: set[str] = set()
 
@@ -306,30 +383,44 @@ def expand_targets(targets: Iterable[str]) -> list[str]:
         token = token.strip()
         if not token:
             continue
-        for host in _expand_single_target(token):
-            if host not in seen:
-                seen.add(host)
-                expanded.append(host)
+        for host in _expand_single_target(token, max_targets):
+            if host in seen:
+                continue
+            if len(expanded) >= max_targets:
+                raise ValueError(
+                    f"target list exceeds {max_targets} hosts; narrow the "
+                    "range or raise --max-targets"
+                )
+            seen.add(host)
+            expanded.append(host)
 
     if not expanded:
         raise ValueError("no valid targets supplied")
     return expanded
 
 
-def _expand_single_target(token: str) -> Iterator[str]:
+def _expand_single_target(token: str, max_targets: int) -> Iterator[str]:
     # CIDR network (e.g. 192.168.1.0/24 or 2001:db8::/120).
     if "/" in token:
         try:
             network = ipaddress.ip_network(token, strict=False)
         except ValueError:
             raise ValueError(f"invalid network: {token!r}")
-        hosts = list(network.hosts())
-        # A /32 or /128 yields no .hosts(); fall back to the address itself.
-        if not hosts:
-            yield str(network.network_address)
-            return
-        for addr in hosts:
+        # Check the size before materialising: a /8 is 16.7M addresses and an
+        # IPv6 /64 is 2**64, either of which would hang the process.
+        if network.num_addresses > max_targets + 2:
+            raise ValueError(
+                f"network {token} expands to {network.num_addresses} "
+                f"addresses, above the {max_targets} limit; narrow the range "
+                "or raise --max-targets"
+            )
+        empty = True
+        for addr in network.hosts():
+            empty = False
             yield str(addr)
+        # A /32 or /128 yields no .hosts(); fall back to the address itself.
+        if empty:
+            yield str(network.network_address)
         return
 
     # Plain IP literal or hostname; leave hostnames for the OS resolver.
@@ -375,8 +466,510 @@ def _scapy_available() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Port scanning back-ends
+# Connect-scan engine: non-blocking sockets driven by one selector
 # --------------------------------------------------------------------------- #
+def _errnos(*names: str) -> frozenset:
+    """Collect the errno values that exist on this platform."""
+    return frozenset(
+        value
+        for value in (getattr(errno, name, None) for name in names)
+        if value is not None
+    )
+
+
+# connect() on a non-blocking socket signals "not finished yet" through these.
+_INPROGRESS_ERRNOS = _errnos(
+    "EINPROGRESS", "EWOULDBLOCK", "EAGAIN", "EALREADY",
+    "WSAEWOULDBLOCK", "WSAEINPROGRESS", "WSAEALREADY",
+)
+# A refusal or reset proves the host is up and the port is shut.
+_CLOSED_ERRNOS = _errnos(
+    "ECONNREFUSED", "ECONNRESET", "WSAECONNREFUSED", "WSAECONNRESET",
+)
+# Running out of descriptors is a local resource problem, never a port verdict.
+_EXHAUSTED_ERRNOS = _errnos("EMFILE", "ENFILE", "ENOBUFS", "WSAEMFILE")
+
+
+@dataclass(frozen=True)
+class _Endpoint:
+    """A resolved target: the address family and numeric address to dial."""
+
+    family: int
+    address: str
+    scope: tuple = ()
+
+    def sockaddr(self, port: int) -> tuple:
+        return (self.address, port) + self.scope
+
+
+def resolve_endpoint(host: str) -> _Endpoint:
+    """Resolve ``host`` once, so a whole port sweep shares a single lookup.
+
+    Resolving inside the probe turns a 65535-port sweep into 65535 resolver
+    calls. Doing it once is both far faster and considerably kinder to the
+    resolver.
+
+    Raises:
+        OSError: if the name cannot be resolved.
+    """
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    if not infos:  # pragma: no cover - getaddrinfo raises instead
+        raise OSError(f"cannot resolve {host}")
+    family, _, _, _, sockaddr = infos[0]
+    if family == socket.AF_INET6:
+        return _Endpoint(family, sockaddr[0], tuple(sockaddr[2:4]))
+    return _Endpoint(family, sockaddr[0])
+
+
+class SocketBudget:
+    """Process-wide cap on probe sockets held open simultaneously.
+
+    Every connect in flight costs a file descriptor. Past the process limit
+    socket creation fails, and a scanner that mistakes those failures for port
+    verdicts silently reports live services as filtered -- so the ceiling is
+    enforced here instead of being discovered the hard way. The budget is
+    shared across hosts: one host may use the whole allowance, while sixteen
+    parallel hosts divide it between them.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, capacity)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def in_use(self) -> int:
+        with self._lock:
+            return self._used
+
+    def acquire(self) -> bool:
+        """Claim one slot. Returns False when the budget is exhausted."""
+        with self._lock:
+            if self._used >= self.capacity:
+                return False
+            self._used += 1
+            return True
+
+    def release(self, count: int = 1) -> None:
+        with self._lock:
+            self._used = max(0, self._used - count)
+
+    def shrink(self, floor: int = 32) -> int:
+        """Halve the ceiling after descriptor exhaustion.
+
+        Returns the new capacity.
+        """
+        with self._lock:
+            self.capacity = max(floor, self.capacity // 2)
+            LOGGER.debug("socket budget reduced to %d", self.capacity)
+            return self.capacity
+
+
+def default_socket_budget() -> int:
+    """Probe sockets this process can comfortably keep open at once."""
+    if sys.platform == "win32":  # pragma: no cover - platform specific
+        return WINDOWS_SOCKET_BUDGET
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-POSIX without win32
+        return 256
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < hard:
+        # Raising the soft limit toward the hard one needs no privileges.
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            soft = hard
+        except (ValueError, OSError):  # pragma: no cover - policy dependent
+            pass
+    if soft == resource.RLIM_INFINITY:
+        soft = MAX_SOCKET_BUDGET + SOCKET_BUDGET_HEADROOM
+    return max(64, min(soft - SOCKET_BUDGET_HEADROOM, MAX_SOCKET_BUDGET))
+
+
+_BUDGET_LOCK = threading.Lock()
+_SHARED_BUDGET: Optional[SocketBudget] = None
+
+
+def shared_socket_budget() -> SocketBudget:
+    """The process-wide budget, created on first use."""
+    global _SHARED_BUDGET
+    with _BUDGET_LOCK:
+        if _SHARED_BUDGET is None:
+            _SHARED_BUDGET = SocketBudget(default_socket_budget())
+        return _SHARED_BUDGET
+
+
+def configure_socket_budget(capacity: int) -> SocketBudget:
+    """Override the process-wide socket ceiling (see ``--max-sockets``)."""
+    global _SHARED_BUDGET
+    with _BUDGET_LOCK:
+        _SHARED_BUDGET = SocketBudget(capacity)
+        return _SHARED_BUDGET
+
+
+def order_ports(ports: Iterable[int]) -> list[int]:
+    """Order a port list so SSH's usual homes are probed first.
+
+    Scanning ascending reaches port 22222 only at the very end of a full
+    sweep. Front-loading the handful of ports SSH actually uses costs nothing
+    and is what makes the first useful result appear almost immediately.
+    """
+    unique = sorted(set(ports))
+    available = set(unique)
+    priority = [p for p in SSH_PRIORITY_PORTS if p in available]
+    promoted = set(priority)
+    return priority + [p for p in unique if p not in promoted]
+
+
+def _classify_connect_errno(code: int) -> str:
+    """Map a failed connect() error to a port verdict."""
+    if code in _CLOSED_ERRNOS:
+        return CLOSED
+    return FILTERED
+
+
+@dataclass
+class _Probe:
+    """One connect() in flight."""
+
+    port: int
+    fd: int
+    sock: socket.socket
+    deadline: float
+    done: bool = False
+
+
+@dataclass
+class _SweepOutcome:
+    """Aggregate verdicts from sweeping one host."""
+
+    open_ports: list[int] = field(default_factory=list)
+    closed: int = 0
+    filtered: int = 0
+    probed: int = 0
+    unresponsive: bool = False
+
+
+class _UnresponsiveGate:
+    """Decides when a large sweep of a silent host should be abandoned.
+
+    A host that returns neither a SYN/ACK nor a RST across the first few
+    hundred probes is firewalled or down. Continuing costs one timeout per
+    remaining port -- eleven minutes for a full range at the default two
+    seconds -- and yields nothing. Because SSH's usual ports are probed first,
+    a reachable SSH service is always seen before this can trip.
+    """
+
+    def __init__(
+        self,
+        total_ports: int,
+        threshold: int = EARLY_EXIT_PROBES,
+        min_ports: int = EARLY_EXIT_MIN_PORTS,
+    ):
+        self.enabled = total_ports > min_ports
+        self.threshold = threshold
+        self.probed = 0
+        self.answered = 0
+
+    def record(self, status: str) -> None:
+        self.probed += 1
+        if status != FILTERED:
+            self.answered += 1
+
+    def tripped(self) -> bool:
+        return (
+            self.enabled
+            and self.answered == 0
+            and self.probed >= self.threshold
+        )
+
+
+def _sweep_pass(
+    endpoint: _Endpoint,
+    ports: list[int],
+    *,
+    timeout: float,
+    max_inflight: int,
+    budget: SocketBudget,
+    on_result: Callable[[int, str, Optional[socket.socket]], bool],
+    on_timeout: Optional[Callable[[int], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+) -> tuple[list[int], list[int]]:
+    """Probe every port in ``ports`` once, driving all sockets from one thread.
+
+    ``on_result`` receives ``(port, status, socket_or_None)`` and returns True
+    if it has taken ownership of a connected socket -- which lets the caller
+    read the SSH banner over the very connection that proved the port open,
+    halving the handshakes an SSH service costs.
+
+    Returns ``(timed_out, unresolved)``: ports that answered nothing, and ports
+    left without a verdict because the sweep stopped early.
+    """
+    selector = selectors.DefaultSelector()
+    live: dict[int, _Probe] = {}
+    expiry: deque = deque()  # Probes in deadline order (all share one timeout).
+    timed_out: list[int] = []
+    unresolved: list[int] = []
+    index = 0
+    aborted = False
+
+    def retire(probe: _Probe) -> None:
+        probe.done = True
+        live.pop(probe.fd, None)
+        try:
+            selector.unregister(probe.sock)
+        except (KeyError, ValueError):  # pragma: no cover - defensive
+            pass
+
+    try:
+        while not aborted:
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            # 1. Top up the in-flight set.
+            while index < len(ports) and len(live) < max_inflight:
+                if not budget.acquire():
+                    break
+                port = ports[index]
+                try:
+                    sock = socket.socket(endpoint.family, socket.SOCK_STREAM)
+                except OSError as exc:
+                    budget.release()
+                    if exc.errno in _EXHAUSTED_ERRNOS and live:
+                        # Drain what is already in flight, then try again with
+                        # a lower ceiling rather than misreport this port.
+                        max_inflight = max(
+                            1, min(max_inflight, budget.shrink())
+                        )
+                        break
+                    index += 1
+                    on_result(port, FILTERED, None)
+                    continue
+                index += 1
+                sock.setblocking(False)
+                try:
+                    code = sock.connect_ex(endpoint.sockaddr(port))
+                except OSError as exc:  # pragma: no cover - platform dependent
+                    code = exc.errno or 0
+                if code == 0:
+                    # Connected without blocking (typical on loopback).
+                    if not on_result(port, OPEN, sock):
+                        sock.close()
+                    budget.release()
+                    continue
+                if code in _INPROGRESS_ERRNOS:
+                    probe = _Probe(port, sock.fileno(), sock,
+                                   time.monotonic() + timeout)
+                    live[probe.fd] = probe
+                    expiry.append(probe)
+                    selector.register(sock, selectors.EVENT_WRITE, probe)
+                    continue
+                sock.close()
+                budget.release()
+                on_result(port, _classify_connect_errno(code), None)
+
+            if not live:
+                if index >= len(ports):
+                    break
+                # Budget momentarily held by other hosts; yield briefly.
+                time.sleep(0.005)
+                continue
+
+            # 2. Wait for completions, but never past the nearest deadline.
+            while expiry and expiry[0].done:
+                expiry.popleft()
+            wait_for = POLL_INTERVAL
+            if expiry:
+                wait_for = min(
+                    POLL_INTERVAL,
+                    max(0.0, expiry[0].deadline - time.monotonic()),
+                )
+            for key, _ in selector.select(timeout=wait_for):
+                probe = key.data
+                retire(probe)
+                try:
+                    code = probe.sock.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_ERROR
+                    )
+                except OSError as exc:  # pragma: no cover - defensive
+                    code = exc.errno or 0
+                if code == 0:
+                    if not on_result(probe.port, OPEN, probe.sock):
+                        probe.sock.close()
+                else:
+                    probe.sock.close()
+                    on_result(probe.port, _classify_connect_errno(code), None)
+                budget.release()
+
+            # 3. Expire probes that never answered.
+            now = time.monotonic()
+            while expiry and (expiry[0].done or expiry[0].deadline <= now):
+                probe = expiry.popleft()
+                if probe.done:
+                    continue
+                retire(probe)
+                probe.sock.close()
+                budget.release()
+                timed_out.append(probe.port)
+                if on_timeout is not None:
+                    on_timeout(probe.port)
+
+            if should_abort is not None and should_abort():
+                aborted = True
+    finally:
+        # Anything still in flight never reached a verdict; report it as such
+        # rather than letting the caller assume the range was fully covered.
+        for probe in list(live.values()):
+            retire(probe)
+            probe.sock.close()
+            budget.release()
+            unresolved.append(probe.port)
+        selector.close()
+
+    unresolved.extend(ports[index:])
+    return timed_out, unresolved
+
+
+def _connect_sweep(
+    host: str,
+    ports: list[int],
+    *,
+    timeout: float,
+    max_inflight: int,
+    retries: int = 0,
+    stop_event: Optional[threading.Event] = None,
+    progress: Optional[ProgressReporter] = None,
+    on_open: Optional[Callable[[int, Optional[socket.socket]], bool]] = None,
+    budget: Optional[SocketBudget] = None,
+    early_exit: bool = True,
+) -> _SweepOutcome:
+    """Sweep one host's ports, reporting each verdict as it lands."""
+    outcome = _SweepOutcome()
+    if not ports:
+        return outcome
+
+    endpoint = resolve_endpoint(host)
+    budget = budget if budget is not None else shared_socket_budget()
+    queue = order_ports(ports)
+    priority = {p for p in SSH_PRIORITY_PORTS if p in set(queue)}
+    # Priority ports that answered nothing -- the only ones worth a retry.
+    silent_priority: set = set()
+    gate = _UnresponsiveGate(len(queue)) if early_exit else None
+
+    def record(port: int, status: str, sock: Optional[socket.socket]) -> bool:
+        taken = False
+        if status == OPEN:
+            outcome.open_ports.append(port)
+            silent_priority.discard(port)
+            if progress is not None:
+                progress.log(f"  [+] open   {host}:{port}  (identifying...)")
+            if on_open is not None:
+                taken = bool(on_open(port, sock))
+        elif status == CLOSED:
+            outcome.closed += 1
+            silent_priority.discard(port)
+        else:
+            outcome.filtered += 1
+            if port in priority:
+                silent_priority.add(port)
+        outcome.probed += 1
+        if gate is not None:
+            gate.record(status)
+        if progress is not None:
+            progress.tick(1, opened=1 if status == OPEN else 0)
+        return taken
+
+    attempt = 0
+    while queue:
+        final = attempt >= retries
+        timed_out, unresolved = _sweep_pass(
+            endpoint,
+            queue,
+            timeout=timeout,
+            max_inflight=max_inflight,
+            budget=budget,
+            on_result=record,
+            on_timeout=(lambda p: record(p, FILTERED, None)) if final else None,
+            stop_event=stop_event,
+            should_abort=gate.tripped if gate is not None else None,
+        )
+        if unresolved:
+            if gate is not None and gate.tripped():
+                outcome.unresponsive = True
+                outcome.filtered += len(unresolved)
+                if progress is not None:
+                    progress.tick(len(unresolved))
+            break
+        if final or not timed_out:
+            break
+        queue = timed_out
+        attempt += 1
+
+    _reprobe_ssh_ports(
+        host,
+        endpoint,
+        sorted(silent_priority),
+        outcome,
+        timeout=timeout,
+        budget=budget,
+        stop_event=stop_event,
+        progress=progress,
+        on_open=on_open,
+    )
+    outcome.open_ports.sort()
+    return outcome
+
+
+def _reprobe_ssh_ports(
+    host: str,
+    endpoint: _Endpoint,
+    candidates: list[int],
+    outcome: _SweepOutcome,
+    *,
+    timeout: float,
+    budget: SocketBudget,
+    stop_event: Optional[threading.Event],
+    progress: Optional[ProgressReporter],
+    on_open: Optional[Callable[[int, Optional[socket.socket]], bool]],
+) -> None:
+    """Give SSH's usual ports a second chance before calling them filtered.
+
+    ``candidates`` are the priority ports that answered nothing at all. A
+    dropped SYN is the one packet loss that actually costs this tool a
+    finding, and at high concurrency it does happen. Re-probing this handful
+    is bounded by a single timeout, so the accuracy is close to free -- unlike
+    a blanket ``--retries``, which doubles the cost of the whole sweep.
+    """
+    if not candidates or (stop_event is not None and stop_event.is_set()):
+        return
+
+    def record(port: int, status: str, sock: Optional[socket.socket]) -> bool:
+        if status == FILTERED:
+            return False
+        # Every candidate was counted as filtered by the main sweep, so a
+        # verdict here replaces that tally rather than adding to it.
+        outcome.filtered = max(0, outcome.filtered - 1)
+        outcome.unresponsive = False  # The host answered after all.
+        if status == CLOSED:
+            outcome.closed += 1
+            return False
+        outcome.open_ports.append(port)
+        if progress is not None:
+            progress.log(f"  [+] open   {host}:{port}  (identifying...)")
+        return bool(on_open(port, sock)) if on_open is not None else False
+
+    _sweep_pass(
+        endpoint,
+        candidates,
+        timeout=timeout,
+        max_inflight=max(1, min(len(candidates), budget.capacity)),
+        budget=budget,
+        on_result=record,
+        stop_event=stop_event,
+    )
+
+
 def connect_scan_host(
     host: str,
     ports: list[int],
@@ -386,92 +979,51 @@ def connect_scan_host(
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
     on_open: Optional[Callable[[int], None]] = None,
+    *,
+    budget: Optional[SocketBudget] = None,
+    early_exit: bool = True,
 ) -> tuple[list[int], int, int]:
-    """Concurrent TCP connect scan of a single host.
+    """Non-blocking TCP connect scan of a single host.
 
-    Returns ``(open_ports, closed_count, filtered_count)``. Open sockets are
-    reported live via ``progress`` as they are found, and ``on_open`` (if
-    given) is invoked with each open port the instant it is discovered -- this
-    lets the caller pipeline service identification while the rest of the port
-    range is still being scanned. The scan unwinds promptly when ``stop_event``
-    is set, cancelling any not-yet-started probes so a Ctrl+C does not block on
-    a huge backlog of queued work.
+    ``workers`` bounds how many connects this host keeps in flight; the real
+    ceiling is the process-wide :class:`SocketBudget`. All of them are driven
+    from one thread by a selector, so concurrency costs a file descriptor
+    rather than an OS thread.
+
+    Returns ``(open_ports, closed_count, filtered_count)``. Open ports are
+    reported live through ``progress`` and handed to ``on_open`` the instant
+    they are found, so a caller can identify services while the rest of the
+    range is still being swept.
     """
-    open_ports: list[int] = []
-    closed = 0
-    filtered = 0
-    if not ports:
-        return open_ports, closed, filtered
-
-    pool_size = max(1, min(workers, len(ports)))
-    executor = ThreadPoolExecutor(max_workers=pool_size)
-    futures = {
-        executor.submit(_probe_port, host, port, timeout, retries, stop_event): port
-        for port in ports
-    }
-    try:
-        for future in as_completed(futures):
-            if stop_event is not None and stop_event.is_set():
-                break
-            port = futures[future]
-            try:
-                status = future.result()
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.debug("probe %s:%s failed: %s", host, port, exc)
-                status = FILTERED
-            if status == OPEN:
-                open_ports.append(port)
-                if progress is not None:
-                    progress.log(f"  [+] open   {host}:{port}  (identifying...)")
-                if on_open is not None:
-                    on_open(port)
-            elif status == CLOSED:
-                closed += 1
-            else:
-                filtered += 1
-            if progress is not None:
-                progress.tick(1, opened=1 if status == OPEN else 0)
-    finally:
-        for future in futures:
-            future.cancel()
-        executor.shutdown(wait=False)
-    return sorted(open_ports), closed, filtered
-
-
-def _probe_port(
-    host: str,
-    port: int,
-    timeout: float,
-    retries: int,
-    stop_event: Optional[threading.Event] = None,
-) -> str:
-    """Probe a single TCP port and classify the outcome.
-
-    Returns one of ``OPEN``, ``CLOSED`` or ``FILTERED``.
-    """
-    last_attempt = retries + 1
-    for _ in range(last_attempt):
-        if stop_event is not None and stop_event.is_set():
-            return FILTERED
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return OPEN
-        except ConnectionRefusedError:
-            return CLOSED  # Reachable host, port closed (RST).
-        except ConnectionResetError:
-            return CLOSED
-        except socket.timeout:
-            continue  # No response; retry if budget remains.
-        except OSError:
-            # Network unreachable, DNS failure, etc. Treat as filtered.
-            return FILTERED
-    return FILTERED
+    outcome = _connect_sweep(
+        host,
+        ports,
+        timeout=timeout,
+        max_inflight=max(1, workers),
+        retries=retries,
+        stop_event=stop_event,
+        progress=progress,
+        on_open=(lambda port, _sock: bool(on_open(port))) if on_open else None,
+        budget=budget,
+        early_exit=early_exit,
+    )
+    return outcome.open_ports, outcome.closed, outcome.filtered
 
 
 def syn_scan_host(
-    host: str, ports: list[int], timeout: float
+    host: str,
+    ports: list[int],
+    timeout: float,
+    stop_event: Optional[threading.Event] = None,
+    progress: Optional[ProgressReporter] = None,
+    on_open: Optional[Callable[[int, Optional[socket.socket]], bool]] = None,
+    chunk_size: int = SYN_CHUNK_SIZE,
 ) -> tuple[list[int], int, int]:
     """Half-open SYN scan of a single host using Scapy. Requires root.
+
+    Ports are sent in batches so the scan reports progress as it goes, hands
+    open ports onward for identification immediately, and can be interrupted
+    -- a single Scapy call over 65535 ports does none of those things.
 
     Returns ``(open_ports, closed_count, filtered_count)``.
     """
@@ -481,53 +1033,174 @@ def syn_scan_host(
     if not ports:
         return [], 0, 0
 
-    try:
-        resolved = socket.gethostbyname(host)
-    except OSError as exc:
-        raise RuntimeError(f"cannot resolve {host}: {exc}") from exc
+    endpoint = resolve_endpoint(host)
+    if endpoint.family != socket.AF_INET:
+        raise RuntimeError(
+            f"syn scan supports IPv4 only; {host} resolved to "
+            f"{endpoint.address} - use --scan-method connect"
+        )
 
-    open_ports: set[int] = set()
+    open_ports: list[int] = []
     closed = 0
-    packets = IP(dst=resolved) / TCP(dport=ports, flags="S")
-    answered, _ = sr(packets, timeout=timeout, verbose=0)
-    for _, received in answered:
-        tcp_layer = received.getlayer(TCP)
-        if tcp_layer is None:
-            continue
-        if tcp_layer.flags == 0x12:  # SYN/ACK -> open
-            open_ports.add(int(tcp_layer.sport))
-            # Politely tear down the half-open connection with a RST.
-            send(IP(dst=resolved) / TCP(dport=tcp_layer.sport, flags="R"),
-                 verbose=0)
-        elif tcp_layer.flags == 0x14:  # RST/ACK -> closed
-            closed += 1
-    filtered = max(0, len(ports) - len(answered))
+    filtered = 0
+    for chunk in _chunk(order_ports(ports), max(1, chunk_size)):
+        if stop_event is not None and stop_event.is_set():
+            break
+        answered, _ = sr(
+            IP(dst=endpoint.address) / TCP(dport=chunk, flags="S"),
+            timeout=timeout,
+            verbose=0,
+        )
+        replies = 0
+        for _, received in answered:
+            tcp_layer = received.getlayer(TCP)
+            if tcp_layer is None:
+                continue
+            replies += 1
+            port = int(tcp_layer.sport)
+            if tcp_layer.flags == 0x12:  # SYN/ACK -> open
+                open_ports.append(port)
+                if progress is not None:
+                    progress.log(
+                        f"  [+] open   {host}:{port}  (identifying...)"
+                    )
+                if on_open is not None:
+                    on_open(port, None)
+                # Politely tear down the half-open connection with a RST.
+                send(IP(dst=endpoint.address) / TCP(dport=port, flags="R"),
+                     verbose=0)
+            elif tcp_layer.flags == 0x14:  # RST/ACK -> closed
+                closed += 1
+        filtered += max(0, len(chunk) - replies)
+        if progress is not None:
+            progress.tick(len(chunk), opened=len(open_ports))
     return sorted(open_ports), closed, filtered
+
+
+def _chunk(items: list, size: int) -> Iterator[list]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 # --------------------------------------------------------------------------- #
 # SSH validation
 # --------------------------------------------------------------------------- #
-def grab_ssh_banner(host: str, port: int, timeout: float) -> Optional[str]:
-    """Connect and read the SSH identification banner.
+class _BufferedReader:
+    """Line and fixed-length reads over one socket, sharing a read buffer.
+
+    The SSH identification exchange is line-oriented while everything after it
+    is binary and length-prefixed. Buffering lets both share a connection
+    without the byte-at-a-time reads that reading lines from a raw socket
+    otherwise requires, and enforces a single deadline across the whole
+    exchange so a slow trickle of bytes cannot stall a probe indefinitely.
+    """
+
+    def __init__(self, sock: socket.socket, timeout: float):
+        self._sock = sock
+        self._buffer = b""
+        self._deadline = time.monotonic() + timeout
+
+    def _fill(self, size: int = 4096) -> bool:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            self._sock.settimeout(remaining)
+            chunk = self._sock.recv(size)
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        self._buffer += chunk
+        return True
+
+    def read_line(self, limit: int) -> Optional[bytes]:
+        """Return the next line without its terminator, or None if there is
+        no complete line within ``limit`` bytes and the deadline."""
+        while True:
+            index = self._buffer.find(b"\n")
+            if index >= 0:
+                line = self._buffer[:index]
+                self._buffer = self._buffer[index + 1:]
+                return line.rstrip(b"\r")
+            if len(self._buffer) > limit:
+                return None  # Not line-oriented; stop reading.
+            if not self._fill():
+                return None
+
+    def read_exact(self, count: int) -> bytes:
+        """Read exactly ``count`` bytes.
+
+        Raises:
+            OSError: if the peer closes or goes quiet before they arrive.
+        """
+        while len(self._buffer) < count:
+            if not self._fill(max(4096, count - len(self._buffer))):
+                raise OSError("connection closed mid-packet")
+        data = self._buffer[:count]
+        self._buffer = self._buffer[count:]
+        return data
+
+
+def read_ssh_identification(
+    reader: _BufferedReader, max_lines: int = MAX_PREAMBLE_LINES
+) -> Optional[str]:
+    """Scan incoming lines for the SSH identification string.
+
+    RFC 4253 section 4.2 permits a server to send any number of other lines --
+    legal notices, load messages -- before its ``SSH-`` identification string,
+    and requires clients to skip them. A scanner that reads one buffer and
+    demands ``SSH-`` at offset zero misses every such server.
+    """
+    for _ in range(max_lines):
+        line = reader.read_line(MAX_IDENT_LINE)
+        if line is None:
+            return None
+        if line.startswith(SSH_BANNER_PREFIX):
+            return line[:MAX_IDENT_LINE].decode("latin-1", "replace")
+    return None
+
+
+def grab_ssh_banner(
+    host: str,
+    port: int,
+    timeout: float,
+    sock: Optional[socket.socket] = None,
+) -> Optional[str]:
+    """Confirm a port speaks SSH by completing the identification exchange.
+
+    Our identification string goes out first, exactly as OpenSSH does. Servers
+    that withhold their banner until the client identifies -- and the proxies
+    and jump hosts that front them -- otherwise sit silent until the timeout
+    expires and get written off as "not SSH".
+
+    ``sock`` adopts an already-connected socket, so a port discovered by the
+    sweep is identified over that same connection instead of paying for a
+    second TCP handshake. The socket is always closed before returning.
 
     Returns the banner string if the service speaks SSH, otherwise None.
     """
+    connection = sock
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            data = sock.recv(256)
-            if not data.startswith(SSH_BANNER_PREFIX):
-                return None
-            # Some servers wait for our identification before proceeding;
-            # send it so the connection closes cleanly.
-            try:
-                sock.sendall(CLIENT_BANNER)
-            except OSError:
-                pass
-            return data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        if connection is None:
+            connection = socket.create_connection((host, port), timeout=timeout)
+        connection.setblocking(True)
+        connection.settimeout(timeout)
+        connection.sendall(CLIENT_BANNER)
+        return read_ssh_identification(_BufferedReader(connection, timeout))
     except OSError:
         return None
+    finally:
+        _close_quietly(connection)
+
+
+def _close_quietly(sock: Optional[socket.socket]) -> None:
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:  # pragma: no cover - defensive
+        pass
 
 
 def validate_ssh_paramiko(host: str, port: int, timeout: float) -> Optional[str]:
@@ -668,27 +1341,45 @@ def parse_kexinit(payload: bytes) -> Optional[dict]:
     return result
 
 
-def read_server_kexinit(host: str, port: int, timeout: float) -> Optional[dict]:
-    """Connect, exchange identification strings and read the server KEXINIT."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        banner = _read_ident_line(sock)
+def read_server_kexinit(
+    host: str,
+    port: int,
+    timeout: float,
+    sock: Optional[socket.socket] = None,
+) -> Optional[dict]:
+    """Connect, exchange identification strings and read the server KEXINIT.
+
+    Raises:
+        OSError: if the connection fails or dies mid-packet.
+    """
+    connection = sock
+    try:
+        if connection is None:
+            connection = socket.create_connection((host, port), timeout=timeout)
+        connection.setblocking(True)
+        connection.settimeout(timeout)
+        connection.sendall(CLIENT_BANNER)
+        reader = _BufferedReader(connection, timeout)
+        banner = read_ssh_identification(reader)
         if banner is None:
             return None
-        sock.sendall(CLIENT_BANNER)
         # First binary packet from the server is its KEXINIT. Pre-key-exchange
         # packets are unencrypted and carry no MAC, so we can read them raw.
-        (packet_len,) = struct.unpack(">I", _recv_exact(sock, 4))
-        if not 2 <= packet_len <= 200_000:
+        (packet_len,) = struct.unpack(">I", reader.read_exact(4))
+        if not 2 <= packet_len <= MAX_SSH_PACKET:
             return None
-        body = _recv_exact(sock, packet_len)
+        body = reader.read_exact(packet_len)
         padding_len = body[0]
+        if padding_len + 1 > packet_len:
+            return None  # Padding cannot exceed the packet it pads.
         payload = body[1:packet_len - padding_len]
         parsed = parse_kexinit(payload)
         if parsed is None:
             return None
         parsed["banner"] = banner
         return parsed
+    finally:
+        _close_quietly(connection)
 
 
 def is_terrapin_vulnerable(kex: dict) -> bool:
@@ -760,37 +1451,6 @@ def _unique(*lists: list[str]) -> list[str]:
         for item in items:
             seen.setdefault(item, None)
     return list(seen)
-
-
-def _recv_exact(sock: socket.socket, count: int) -> bytes:
-    buffer = b""
-    while len(buffer) < count:
-        chunk = sock.recv(count - len(buffer))
-        if not chunk:
-            raise OSError("connection closed mid-packet")
-        buffer += chunk
-    return buffer
-
-
-def _read_ident_line(sock: socket.socket, max_lines: int = 20) -> Optional[str]:
-    """Read the server identification line (the one starting with 'SSH-').
-
-    Reads a byte at a time so the following binary KEXINIT packet is left
-    untouched in the socket buffer.
-    """
-    for _ in range(max_lines):
-        line = b""
-        while not line.endswith(b"\n"):
-            char = sock.recv(1)
-            if not char:
-                return None
-            line += char
-            if len(line) > 1024:
-                break
-        text = line.rstrip(b"\r\n")
-        if text.startswith(SSH_BANNER_PREFIX):
-            return text.decode("latin-1", "replace")
-    return None
 
 
 class _ParamikoUnavailable(Exception):
@@ -875,15 +1535,18 @@ def scan_host(
     audit: bool = False,
     stop_event: Optional[threading.Event] = None,
     progress: Optional[ProgressReporter] = None,
+    stream: Optional[EventStream] = None,
+    budget: Optional[SocketBudget] = None,
+    early_exit: bool = True,
 ) -> HostResult:
     """Scan a single host, identifying the service behind each open port as
     soon as it is discovered.
 
-    Port discovery and service assessment (SSH validation plus optional audit)
-    run as a pipeline on two thread pools: the moment a port is found open it
-    is handed to the assessment pool, so SSH services are confirmed while the
-    rest of the port range is still being scanned -- the user no longer waits
-    for the whole sweep to finish before learning what is SSH.
+    Discovery and assessment (SSH validation plus optional audit) run as a
+    pipeline: the moment a port is found open it is handed to the assessment
+    pool -- along with the socket that discovered it, so identification costs
+    no second handshake -- and SSH services are confirmed while the rest of
+    the port range is still being swept.
     """
     result = HostResult(host=host)
     result.service_checked = validate != "none"
@@ -893,34 +1556,48 @@ def scan_host(
     if result.service_checked:
         assess_pool = ThreadPoolExecutor(max_workers=_assess_pool_size(workers))
 
-    def schedule_assessment(port: int) -> None:
-        if assess_pool is None:
-            return
-        if stop_event is not None and stop_event.is_set():
-            return
-        future = assess_pool.submit(
-            _assess_service, host, port, timeout, validate, audit,
-            stop_event, progress,
-        )
+    def handle_open(port: int, sock: Optional[socket.socket] = None) -> bool:
+        """Pipeline an open port; returns True if it adopted ``sock``."""
+        if stream is not None:
+            stream.emit("open", host=host, port=port)
+        stopping = stop_event is not None and stop_event.is_set()
+        if assess_pool is None or stopping:
+            return False
+        try:
+            future = assess_pool.submit(
+                _assess_service, host, port, timeout, validate, audit,
+                stop_event, progress, sock, stream,
+            )
+        except RuntimeError:  # pragma: no cover - pool already shutting down
+            return False
         assess_futures[future] = port
+        return sock is not None
 
     try:
         if scan_method == "syn":
-            open_ports, closed, filtered = syn_scan_host(host, ports, timeout)
-            if progress is not None:
-                progress.tick(len(ports), opened=len(open_ports))
-            for port in open_ports:
-                if progress is not None:
-                    progress.log(f"  [+] open   {host}:{port}  (identifying...)")
-                schedule_assessment(port)
-        else:
-            open_ports, closed, filtered = connect_scan_host(
-                host, ports, timeout, workers, retries, stop_event, progress,
-                on_open=schedule_assessment,
+            open_ports, closed, filtered = syn_scan_host(
+                host, ports, timeout, stop_event, progress, on_open=handle_open,
             )
-        result.open_ports = open_ports
-        result.closed = closed
-        result.filtered = filtered
+            result.open_ports = open_ports
+            result.closed = closed
+            result.filtered = filtered
+        else:
+            outcome = _connect_sweep(
+                host,
+                ports,
+                timeout=timeout,
+                max_inflight=max(1, workers),
+                retries=retries,
+                stop_event=stop_event,
+                progress=progress,
+                on_open=handle_open,
+                budget=budget,
+                early_exit=early_exit,
+            )
+            result.open_ports = outcome.open_ports
+            result.closed = outcome.closed
+            result.filtered = outcome.filtered
+            result.early_exit = outcome.unresponsive
     except Exception as exc:
         result.error = str(exc)
         LOGGER.debug("scan of %s failed: %s", host, exc)
@@ -965,16 +1642,25 @@ def _assess_service(
     audit: bool,
     stop_event: Optional[threading.Event],
     progress: Optional[ProgressReporter],
+    sock: Optional[socket.socket] = None,
+    stream: Optional[EventStream] = None,
 ) -> _Assessment:
-    """Identify (and optionally audit) the service behind a single open port."""
+    """Identify (and optionally audit) the service behind a single open port.
+
+    ``sock`` is the connection that discovered the port; it is consumed or
+    closed here, never leaked back to the caller.
+    """
     assessment = _Assessment(port=port)
     if stop_event is not None and stop_event.is_set():
+        _close_quietly(sock)
         return assessment
 
-    validator = (
-        validate_ssh_paramiko if validate == "paramiko" else grab_ssh_banner
-    )
-    banner = validator(host, port, timeout)
+    if validate == "paramiko":
+        # Paramiko negotiates from scratch on a connection it owns.
+        _close_quietly(sock)
+        banner = validate_ssh_paramiko(host, port, timeout)
+    else:
+        banner = grab_ssh_banner(host, port, timeout, sock=sock)
     if not banner:
         return assessment
 
@@ -984,11 +1670,15 @@ def _assess_service(
         progress.log(message)
     else:
         LOGGER.info("SSH on %s:%s", host, port)
+    if stream is not None:
+        stream.emit("ssh", host=host, port=port, banner=banner)
 
     if audit and not (stop_event is not None and stop_event.is_set()):
         info = audit_ssh_service(host, port, timeout)
         assessment.audit = info
         _report_audit(progress, info)
+        if stream is not None:
+            stream.emit("audit", host=host, port=port, **info.as_dict())
     return assessment
 
 
@@ -1024,6 +1714,8 @@ def scan_targets(
     host_concurrency: int,
     audit: bool = False,
     progress: Optional[ProgressReporter] = None,
+    stream: Optional[EventStream] = None,
+    early_exit: bool = True,
 ) -> list[HostResult]:
     """Scan many hosts concurrently and return their results.
 
@@ -1052,6 +1744,7 @@ def scan_targets(
             can_handle = False
 
     results_map: dict[str, HostResult] = {}
+    budget = shared_socket_budget()
     pool_size = max(1, min(host_concurrency, len(hosts)))
     executor = ThreadPoolExecutor(max_workers=pool_size)
     futures = {
@@ -1067,6 +1760,9 @@ def scan_targets(
             audit=audit,
             stop_event=stop_event,
             progress=progress,
+            stream=stream,
+            budget=budget,
+            early_exit=early_exit,
         ): host
         for host in hosts
     }
@@ -1077,10 +1773,15 @@ def scan_targets(
             if host in results_map:
                 continue
             try:
-                results_map[host] = future.result()
+                result = future.result()
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.error("unexpected error scanning %s: %s", host, exc)
-                results_map[host] = HostResult(host=host, error=str(exc))
+                result = HostResult(host=host, error=str(exc))
+            results_map[host] = result
+            # Publish each host the moment it finishes rather than banking
+            # every result until the whole scan ends.
+            if stream is not None:
+                stream.emit("host", **result.as_dict())
 
     pending = set(futures)
     try:
@@ -1121,6 +1822,14 @@ def scan_targets(
             len(results),
             len(hosts),
         )
+    if stream is not None:
+        stream.emit(
+            "summary",
+            hosts_requested=len(hosts),
+            hosts_completed=len(results),
+            ssh_services=sum(len(r.ssh_ports) for r in results),
+            interrupted=stop_event.is_set(),
+        )
     return results
 
 
@@ -1143,7 +1852,13 @@ def render_text(results: list[HostResult]) -> str:
             lines.append(f"  error: {result.error}")
             continue
         if not result.open_ports:
-            if result.filtered and not result.responsive:
+            if result.early_exit:
+                lines.append(
+                    "  no open ports - host answered nothing; sweep stopped "
+                    f"early after {EARLY_EXIT_PROBES} silent probes "
+                    "(use --no-early-exit to force the full range)"
+                )
+            elif result.filtered and not result.responsive:
                 lines.append(
                     "  no open ports - host did not respond "
                     f"({result.filtered} filtered); likely firewalled or down"
@@ -1274,7 +1989,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
-        help=f"Concurrent probes per host (default: {DEFAULT_WORKERS}).",
+        help="Connections kept in flight per host "
+        f"(default: {DEFAULT_WORKERS}); --max-sockets is the hard ceiling.",
+    )
+    parser.add_argument(
+        "--max-sockets",
+        type=int,
+        default=0,
+        help="Cap on probe sockets open at once across the whole scan "
+        "(default: derived from the file-descriptor limit).",
+    )
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=DEFAULT_MAX_TARGETS,
+        help="Refuse target lists larger than this "
+        f"(default: {DEFAULT_MAX_TARGETS}).",
+    )
+    parser.add_argument(
+        "--no-early-exit",
+        action="store_true",
+        help="Sweep every port even on hosts that answer nothing at all.",
     )
     parser.add_argument(
         "--host-concurrency",
@@ -1293,6 +2028,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit results as JSON.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Emit newline-delimited JSON events on stdout as ports open and "
+        "SSH services are confirmed, instead of one report at the end.",
     )
     parser.add_argument(
         "-o",
@@ -1353,18 +2094,25 @@ def run(argv: Optional[list[str]] = None) -> int:
     if not tokens:
         parser.error("no targets supplied (provide targets or --target-file)")
 
-    try:
-        hosts = expand_targets(tokens)
-        ports = parse_ports(args.ports)
-    except ValueError as exc:
-        parser.error(str(exc))
-
     if args.workers < 1 or args.host_concurrency < 1:
         parser.error("workers and host-concurrency must be >= 1")
     if args.retries < 0:
         parser.error("retries must be >= 0")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.max_targets < 1:
+        parser.error("max-targets must be >= 1")
+    if args.max_sockets < 0:
+        parser.error("max-sockets must be >= 0")
+
+    try:
+        hosts = expand_targets(tokens, max_targets=args.max_targets)
+        ports = parse_ports(args.ports)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.max_sockets:
+        configure_socket_budget(args.max_sockets)
 
     scan_method = resolve_scan_method(args.scan_method)
     if scan_method == "syn" and not has_raw_socket_privilege():
@@ -1401,6 +2149,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         enabled=progress_enabled,
         quiet=args.quiet,
     )
+    stream = EventStream(sys.stdout) if args.stream else None
 
     try:
         results = scan_targets(
@@ -1414,6 +2163,8 @@ def run(argv: Optional[list[str]] = None) -> int:
             host_concurrency=args.host_concurrency,
             audit=args.audit,
             progress=reporter,
+            stream=stream,
+            early_exit=not args.no_early_exit,
         )
     finally:
         reporter.finish()
@@ -1427,7 +2178,9 @@ def run(argv: Optional[list[str]] = None) -> int:
             LOGGER.error("cannot write output file: %s", exc)
             return 1
         LOGGER.info("results written to %s", args.output)
-    else:
+    elif not args.stream:
+        # With --stream the results already went out as they were found;
+        # a trailing report would corrupt the JSONL on stdout.
         print(output)
 
     # Exit non-zero only on hard errors, not on "nothing found".
