@@ -8,6 +8,7 @@ need an optional dependency (Paramiko) skip themselves when it is absent.
 import contextlib
 import io
 import json
+import logging
 import os
 import signal
 import socket
@@ -1317,6 +1318,411 @@ class PolicyCLITests(unittest.TestCase):
         self.assertEqual(code, sshfinder.EXIT_POLICY_VIOLATION)
         self.assertIn("=== 127.0.0.1 ===", report)   # Full report, and
         self.assertIn("Policy 'pq'", report)         # the verdict after it.
+
+
+# --------------------------------------------------------------------------- #
+# Baseline comparison
+# --------------------------------------------------------------------------- #
+def _baseline_file(case, document):
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    path = os.path.join(tmp.name, "baseline.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        if isinstance(document, str):
+            handle.write(document)
+        else:
+            json.dump(document, handle)
+    return path
+
+
+def _snapshot(host="10.0.0.1", port=22, banner="SSH-2.0-OpenSSH_9.6",
+              open_ports=None, **audit):
+    """One host record in the shape --json emits."""
+    return {
+        "host": host,
+        "open_ports": [port] if open_ports is None else open_ports,
+        "ssh_ports": [port],
+        "banners": {str(port): banner},
+        "audit": {str(port): audit} if audit else {},
+    }
+
+
+class LoadBaselineTests(unittest.TestCase):
+    def test_reads_a_scan_report(self):
+        path = _baseline_file(
+            self, [_snapshot(host_key_fingerprint="SHA256:A")]
+        )
+        baseline = load = sshfinder.load_baseline(path)
+        self.assertEqual(baseline.hosts, {"10.0.0.1"})
+        self.assertIn("10.0.0.1:22", load.services)
+        self.assertEqual(baseline.open_ports["10.0.0.1"], {22})
+
+    def test_round_trips_this_tools_own_json(self):
+        audit = sshfinder.SSHAudit(
+            host="10.0.0.1", port=22, host_key_fingerprint="SHA256:A"
+        )
+        result = sshfinder.HostResult(
+            host="10.0.0.1", open_ports=[22], ssh_ports=[22],
+            banners={22: "SSH-2.0-X"}, audits={22: audit},
+        )
+        path = _baseline_file(self, json.loads(sshfinder.render_json([result])))
+        baseline = sshfinder.load_baseline(path)
+        service = baseline.services["10.0.0.1:22"]
+        self.assertEqual(service["banner"], "SSH-2.0-X")
+        self.assertEqual(service["audit"]["host_key_fingerprint"], "SHA256:A")
+
+    def test_depth_is_read_from_the_baseline(self):
+        shallow = sshfinder.load_baseline(
+            _baseline_file(self, [_snapshot(pq_status="ready")])
+        )
+        deep = sshfinder.load_baseline(
+            _baseline_file(self, [_snapshot(host_key_fingerprint="SHA256:A")])
+        )
+        bare = sshfinder.load_baseline(_baseline_file(self, [_snapshot()]))
+        self.assertTrue(shallow.has_audit)
+        self.assertFalse(shallow.needs_deep_audit)
+        self.assertTrue(deep.needs_deep_audit)
+        self.assertFalse(bare.has_audit)
+
+    def test_missing_file_is_rejected(self):
+        with self.assertRaises(sshfinder.BaselineError):
+            sshfinder.load_baseline("/no/such/baseline.json")
+
+    def test_malformed_json_is_rejected(self):
+        with self.assertRaises(sshfinder.BaselineError) as ctx:
+            sshfinder.load_baseline(_baseline_file(self, "{not json"))
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_wrong_shape_is_rejected(self):
+        for document in ({"host": "x"}, ["not-a-record"], [{"no": "host"}]):
+            with self.subTest(document=document):
+                with self.assertRaises(sshfinder.BaselineError):
+                    sshfinder.load_baseline(_baseline_file(self, document))
+
+    def test_older_report_without_new_fields_still_loads(self):
+        """A baseline from an earlier version must not crash the comparison."""
+        path = _baseline_file(self, [{
+            "host": "10.0.0.1", "open_ports": [22], "ssh_ports": [22],
+            "banners": {"22": "SSH-2.0-X"},
+            # No "audit" key at all, as pre-audit versions emitted.
+        }])
+        baseline = sshfinder.load_baseline(path)
+        self.assertEqual(baseline.services["10.0.0.1:22"]["audit"], {})
+        self.assertFalse(baseline.has_audit)
+
+
+class DiffBaselineTests(unittest.TestCase):
+    def _baseline(self, *snapshots):
+        return sshfinder.load_baseline(_baseline_file(self, list(snapshots)))
+
+    def _current(self, host="10.0.0.1", port=22, banner="SSH-2.0-OpenSSH_9.6",
+                 open_ports=None, ssh=True, **audit):
+        return sshfinder.HostResult(
+            host=host,
+            open_ports=[port] if open_ports is None else open_ports,
+            ssh_ports=[port] if ssh else [],
+            banners={port: banner} if ssh else {},
+            audits={port: sshfinder.SSHAudit(host=host, port=port, **audit)}
+            if ssh and audit else {},
+        )
+
+    def _kinds(self, baseline, results):
+        found = sshfinder.diff_against_baseline(baseline, results)
+        return [change.kind for change in found]
+
+    def test_identical_scan_reports_nothing(self):
+        baseline = self._baseline(_snapshot(host_key_fingerprint="SHA256:A"))
+        current = self._current(host_key_fingerprint="SHA256:A")
+        self.assertEqual(self._kinds(baseline, [current]), [])
+
+    def test_host_key_change_is_an_alert(self):
+        baseline = self._baseline(_snapshot(host_key_fingerprint="SHA256:A"))
+        current = self._current(host_key_fingerprint="SHA256:B")
+        changes = sshfinder.diff_against_baseline(baseline, [current])
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].kind, "host_key_changed")
+        self.assertEqual(changes[0].category, sshfinder.DRIFT_ALERT)
+        self.assertIn("SHA256:A", changes[0].detail)
+        self.assertIn("SHA256:B", changes[0].detail)
+
+    def test_new_and_removed_services(self):
+        baseline = self._baseline(_snapshot(port=22))
+        current = self._current(port=2222, open_ports=[2222])
+        kinds = self._kinds(baseline, [current])
+        self.assertIn("ssh_service_added", kinds)
+        self.assertIn("ssh_service_removed", kinds)
+
+    def test_port_open_and_close(self):
+        baseline = self._baseline(_snapshot(port=22, open_ports=[22, 80]))
+        current = self._current(port=22, open_ports=[22, 443])
+        found = sshfinder.diff_against_baseline(baseline, [current])
+        changes = {c.kind: c.target for c in found}
+        self.assertEqual(changes["port_opened"], "10.0.0.1:443")
+        self.assertEqual(changes["port_closed"], "10.0.0.1:80")
+
+    def test_password_auth_regression_and_fix(self):
+        was_key_only = _snapshot(
+            auth_methods=["publickey"], password_auth=False
+        )
+        baseline = self._baseline(was_key_only)
+        regressed = self._current(auth_methods=["publickey", "password"])
+        self.assertIn(
+            "password_auth_enabled", self._kinds(baseline, [regressed])
+        )
+
+        was_password = _snapshot(
+            auth_methods=["publickey", "password"], password_auth=True
+        )
+        fixed = self._current(auth_methods=["publickey"])
+        self.assertIn(
+            "password_auth_disabled",
+            self._kinds(self._baseline(was_password), [fixed]),
+        )
+
+    def test_terrapin_regression_and_fix(self):
+        safe = self._baseline(_snapshot(terrapin_vulnerable=False))
+        vulnerable = self._current(terrapin_vulnerable=True)
+        self.assertIn("terrapin_regression", self._kinds(safe, [vulnerable]))
+
+        was_vulnerable = self._baseline(_snapshot(terrapin_vulnerable=True))
+        now_safe = self._current(terrapin_vulnerable=False)
+        self.assertIn("terrapin_fixed", self._kinds(was_vulnerable, [now_safe]))
+
+    def test_post_quantum_regression_and_improvement(self):
+        ready = self._baseline(_snapshot(pq_status=sshfinder.PQ_READY))
+        lost = self._current(pq_status=sshfinder.PQ_ABSENT)
+        changes = sshfinder.diff_against_baseline(ready, [lost])
+        self.assertEqual(changes[0].kind, "post_quantum_regression")
+        self.assertEqual(changes[0].category, sshfinder.DRIFT_ALERT)
+
+        absent = self._baseline(_snapshot(pq_status=sshfinder.PQ_ABSENT))
+        gained = self._current(pq_status=sshfinder.PQ_READY)
+        improved = sshfinder.diff_against_baseline(absent, [gained])
+        self.assertEqual(improved[0].kind, "post_quantum_improved")
+        self.assertEqual(improved[0].category, sshfinder.DRIFT_IMPROVED)
+
+    def test_weakness_added_and_resolved(self):
+        baseline = self._baseline(_snapshot(weaknesses=["weak MACs: hmac-md5"]))
+        current = self._current(weaknesses=["weak ciphers: aes128-cbc"])
+        found = sshfinder.diff_against_baseline(baseline, [current])
+        changes = {c.kind: c.detail for c in found}
+        self.assertIn("aes128-cbc", changes["weakness_added"])
+        self.assertIn("hmac-md5", changes["weakness_resolved"])
+
+    def test_banner_change_is_informational(self):
+        baseline = self._baseline(_snapshot(banner="SSH-2.0-OpenSSH_9.6"))
+        current = self._current(banner="SSH-2.0-OpenSSH_7.4")
+        changes = sshfinder.diff_against_baseline(baseline, [current])
+        self.assertEqual(changes[0].kind, "banner_changed")
+        self.assertEqual(changes[0].category, sshfinder.DRIFT_INFO)
+
+    # --- Guards against inventing changes out of missing data ------------- #
+
+    def test_hosts_absent_from_this_scan_are_not_reported_gone(self):
+        """Scanning one rack must not decommission every other rack."""
+        baseline = self._baseline(
+            _snapshot(host="10.0.0.1"), _snapshot(host="10.0.0.2")
+        )
+        current = self._current(host="10.0.0.1")
+        targets = {c.target for c in
+                   sshfinder.diff_against_baseline(baseline, [current])}
+        self.assertNotIn("10.0.0.2:22", targets)
+
+    def test_a_host_that_errored_is_not_compared(self):
+        baseline = self._baseline(_snapshot())
+        errored = sshfinder.HostResult(host="10.0.0.1", error="unreachable")
+        self.assertEqual(self._kinds(baseline, [errored]), [])
+
+    def test_missing_audit_on_either_side_invents_nothing(self):
+        bare = self._baseline(_snapshot())            # No audit recorded.
+        audited = self._current(
+            host_key_fingerprint="SHA256:A", pq_status=sshfinder.PQ_READY,
+            terrapin_vulnerable=False, weaknesses=[],
+        )
+        self.assertEqual(self._kinds(bare, [audited]), [])
+
+        rich = self._baseline(_snapshot(
+            host_key_fingerprint="SHA256:A", pq_status=sshfinder.PQ_READY,
+            terrapin_vulnerable=False,
+        ))
+        unaudited = self._current()                   # Shallow scan this time.
+        self.assertEqual(self._kinds(rich, [unaudited]), [])
+
+    def test_absent_auth_methods_never_look_like_a_change(self):
+        """password_auth is False when Paramiko never ran; that is not a fix."""
+        baseline = self._baseline(
+            _snapshot(
+                auth_methods=["publickey", "password"], password_auth=True
+            )
+        )
+        no_paramiko = self._current(auth_methods=[], pq_status="unknown")
+        self.assertEqual(self._kinds(baseline, [no_paramiko]), [])
+
+    def test_unknown_post_quantum_is_not_a_regression(self):
+        baseline = self._baseline(_snapshot(pq_status=sshfinder.PQ_READY))
+        current = self._current(pq_status=sshfinder.PQ_UNKNOWN)
+        self.assertEqual(self._kinds(baseline, [current]), [])
+
+    def test_empty_banner_on_either_side_is_not_a_change(self):
+        baseline = self._baseline(_snapshot(banner=""))
+        current = self._current(banner="SSH-2.0-X")
+        self.assertEqual(self._kinds(baseline, [current]), [])
+
+
+class DriftTriageTests(unittest.TestCase):
+    def _changes(self, *categories):
+        return [
+            sshfinder.Change("k", category, "10.0.0.1:22", "d")
+            for category in categories
+        ]
+
+    def test_group_preserves_order_within_a_category(self):
+        changes = [
+            sshfinder.Change("a", sshfinder.DRIFT_ALERT, "s1", "d"),
+            sshfinder.Change("b", sshfinder.DRIFT_ADDED, "s2", "d"),
+            sshfinder.Change("c", sshfinder.DRIFT_ALERT, "s3", "d"),
+        ]
+        grouped = sshfinder.group_changes(changes)
+        self.assertEqual(
+            [c.kind for c in grouped[sshfinder.DRIFT_ALERT]], ["a", "c"]
+        )
+
+    def test_drift_gates_only_on_alerts(self):
+        alerts = self._changes(sshfinder.DRIFT_ALERT)
+        churn = self._changes(
+            sshfinder.DRIFT_ADDED, sshfinder.DRIFT_REMOVED,
+            sshfinder.DRIFT_IMPROVED, sshfinder.DRIFT_INFO,
+        )
+        self.assertEqual(
+            sshfinder.drift_exit_code(alerts, True),
+            sshfinder.EXIT_BASELINE_DRIFT,
+        )
+        self.assertEqual(sshfinder.drift_exit_code(churn, True), 0)
+
+    def test_drift_does_not_gate_unless_asked(self):
+        alerts = self._changes(sshfinder.DRIFT_ALERT)
+        self.assertEqual(sshfinder.drift_exit_code(alerts, False), 0)
+
+    def test_report_orders_alerts_first(self):
+        baseline = sshfinder.Baseline(source="prev.json")
+        changes = [
+            sshfinder.Change("added", sshfinder.DRIFT_ADDED, "s1", "new"),
+            sshfinder.Change("key", sshfinder.DRIFT_ALERT, "s2", "moved"),
+        ]
+        report = sshfinder.render_drift_report(baseline, changes)
+        self.assertLess(report.index("[alert]"), report.index("[added]"))
+        self.assertIn("prev.json", report)
+
+    def test_report_says_so_when_nothing_moved(self):
+        report = sshfinder.render_drift_report(
+            sshfinder.Baseline(source="prev.json"), []
+        )
+        self.assertIn("no changes", report)
+
+
+class BaselineCLITests(unittest.TestCase):
+    def _serve(self, kex, banner=b"SSH-2.0-OpenSSH_9.6\r\n"):
+        payload = build_kexinit_payload(
+            kex=list(kex), hostkey=["ssh-ed25519"],
+            ciphers=["aes256-gcm@openssh.com"],
+            macs=["hmac-sha2-256-etm@openssh.com"],
+        )
+
+        def serve(conn):
+            conn.sendall(banner)
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        return serve
+
+    def _run(self, port, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = sshfinder.run(["127.0.0.1", "-p", str(port), "-q", *extra])
+        return code, stdout.getvalue()
+
+    def test_defaults(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertIsNone(args.baseline)
+        self.assertFalse(args.fail_on_drift)
+
+    def test_fail_on_drift_requires_a_baseline(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["127.0.0.1", "-p", "22", "--fail-on-drift"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_unreadable_baseline_exits_before_scanning(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(
+                    ["127.0.0.1", "-p", "22", "--baseline", "/no/such.json"]
+                )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_capture_then_compare_reports_no_drift(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            _, captured = self._run(server.port, "--pq-report", "--json")
+            path = _baseline_file(self, json.loads(captured))
+            code, report = self._run(server.port, "--baseline", path)
+        self.assertEqual(code, 0)
+        self.assertIn("no changes", report)
+
+    def test_regression_is_reported_and_can_gate(self):
+        with LoopbackServer(self._serve([MLKEM])) as ready:
+            _, captured = self._run(ready.port, "--pq-report", "--json")
+        snapshot = json.loads(captured)
+        with LoopbackServer(self._serve(["curve25519-sha256"])) as degraded:
+            # Re-point the baseline at the port the degraded server owns.
+            snapshot[0]["ssh_ports"] = [degraded.port]
+            snapshot[0]["open_ports"] = [degraded.port]
+            snapshot[0]["banners"] = {str(degraded.port): "SSH-2.0-OpenSSH_9.6"}
+            snapshot[0]["audit"] = {
+                str(degraded.port): {"pq_status": sshfinder.PQ_READY,
+                                     "weaknesses": []}
+            }
+            path = _baseline_file(self, snapshot)
+            reported, report = self._run(degraded.port, "--baseline", path)
+            gated, _ = self._run(
+                degraded.port, "--baseline", path, "--fail-on-drift"
+            )
+        self.assertEqual(reported, 0)
+        self.assertEqual(gated, sshfinder.EXIT_BASELINE_DRIFT)
+        self.assertIn("post-quantum readiness fell", report)
+
+    def test_audit_report_appends_the_drift_section(self):
+        with LoopbackServer(self._serve([MLKEM])) as server:
+            _, captured = self._run(server.port, "--pq-report", "--json")
+            path = _baseline_file(self, json.loads(captured))
+            code, report = self._run(server.port, "--baseline", path, "--audit")
+        self.assertEqual(code, 0)
+        self.assertIn("=== 127.0.0.1 ===", report)
+        self.assertIn("Baseline drift", report)
+
+
+class LoggingTests(unittest.TestCase):
+    """A failed Paramiko handshake is an audit finding, not a stack trace."""
+
+    def setUp(self):
+        paramiko_logger = logging.getLogger("paramiko")
+        previous = paramiko_logger.level
+        self.addCleanup(paramiko_logger.setLevel, previous)
+
+    def test_paramiko_noise_is_suppressed_by_default(self):
+        sshfinder.configure_logging(verbose=0, quiet=False)
+        self.assertEqual(
+            logging.getLogger("paramiko").level, logging.CRITICAL
+        )
+
+    def test_single_verbose_still_suppresses_it(self):
+        sshfinder.configure_logging(verbose=1, quiet=False)
+        self.assertEqual(
+            logging.getLogger("paramiko").level, logging.CRITICAL
+        )
+
+    def test_double_verbose_lets_it_through(self):
+        sshfinder.configure_logging(verbose=2, quiet=False)
+        self.assertEqual(logging.getLogger("paramiko").level, logging.DEBUG)
 
 
 class LiveKexinitTests(unittest.TestCase):
