@@ -892,6 +892,433 @@ class PostQuantumCLITests(unittest.TestCase):
         self.assertIn("1/1", stdout.getvalue())
 
 
+# --------------------------------------------------------------------------- #
+# Policy engine
+# --------------------------------------------------------------------------- #
+def _policy_file(case, document):
+    """Write a policy document to a temporary path scoped to ``case``."""
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    path = os.path.join(tmp.name, "policy.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        if isinstance(document, str):
+            handle.write(document)
+        else:
+            json.dump(document, handle)
+    return path
+
+
+class LoadPolicyTests(unittest.TestCase):
+    def test_builtin_policies_load(self):
+        for name in sshfinder.BUILTIN_POLICIES:
+            with self.subTest(policy=name):
+                policy = sshfinder.load_policy(name)
+                self.assertEqual(policy.name, name)
+                self.assertTrue(policy.rules)
+
+    def test_only_auth_rules_need_the_deep_probe(self):
+        self.assertTrue(sshfinder.load_policy("baseline").needs_auth_methods)
+        self.assertFalse(sshfinder.load_policy("pq").needs_auth_methods)
+
+    def test_policy_document_from_a_path(self):
+        path = _policy_file(self, {
+            "name": "house",
+            "description": "house rules",
+            "rules": [{"check": "terrapin", "severity": "warn"}],
+        })
+        policy = sshfinder.load_policy(path)
+        self.assertEqual(policy.name, "house")
+        self.assertEqual(policy.description, "house rules")
+        self.assertEqual(policy.rules[0]["severity"], "warn")
+
+    def test_severity_defaults_to_fail(self):
+        path = _policy_file(self, {"rules": [{"check": "terrapin"}]})
+        policy = sshfinder.load_policy(path)
+        self.assertEqual(policy.rules[0]["severity"], sshfinder.SEVERITY_FAIL)
+
+    def test_unknown_check_is_rejected(self):
+        """A typo must never quietly turn a failing estate green."""
+        path = _policy_file(self, {"rules": [{"check": "pasword_auth"}]})
+        with self.assertRaises(sshfinder.PolicyError) as ctx:
+            sshfinder.load_policy(path)
+        self.assertIn("pasword_auth", str(ctx.exception))
+        self.assertIn("known:", str(ctx.exception))
+
+    def test_unknown_severity_is_rejected(self):
+        path = _policy_file(self, {
+            "rules": [{"check": "terrapin", "severity": "critical"}]
+        })
+        with self.assertRaises(sshfinder.PolicyError):
+            sshfinder.load_policy(path)
+
+    def test_unknown_field_is_rejected(self):
+        path = _policy_file(self, {
+            "rules": [{"check": "forbid", "field": "cyphers",
+                       "algorithms": ["3des-cbc"]}]
+        })
+        with self.assertRaises(sshfinder.PolicyError) as ctx:
+            sshfinder.load_policy(path)
+        self.assertIn("cyphers", str(ctx.exception))
+
+    def test_unknown_pq_requirement_is_rejected(self):
+        path = _policy_file(self, {
+            "rules": [{"check": "post_quantum", "require": "quantum-proof"}]
+        })
+        with self.assertRaises(sshfinder.PolicyError):
+            sshfinder.load_policy(path)
+
+    def test_empty_algorithm_list_is_rejected(self):
+        for algorithms in ([], "3des-cbc", [42]):
+            with self.subTest(algorithms=algorithms):
+                path = _policy_file(self, {
+                    "rules": [{"check": "forbid", "field": "ciphers",
+                               "algorithms": algorithms}]
+                })
+                with self.assertRaises(sshfinder.PolicyError):
+                    sshfinder.load_policy(path)
+
+    def test_policy_without_rules_is_rejected(self):
+        for document in ({"rules": []}, {"name": "x"}, []):
+            with self.subTest(document=document):
+                path = _policy_file(self, document)
+                with self.assertRaises(sshfinder.PolicyError):
+                    sshfinder.load_policy(path)
+
+    def test_malformed_json_is_rejected(self):
+        path = _policy_file(self, "{not json")
+        with self.assertRaises(sshfinder.PolicyError) as ctx:
+            sshfinder.load_policy(path)
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_missing_file_names_the_builtins(self):
+        with self.assertRaises(sshfinder.PolicyError) as ctx:
+            sshfinder.load_policy("/no/such/policy.json")
+        self.assertIn("baseline", str(ctx.exception))
+
+    def test_rule_must_be_an_object(self):
+        path = _policy_file(self, {"rules": ["terrapin"]})
+        with self.assertRaises(sshfinder.PolicyError):
+            sshfinder.load_policy(path)
+
+
+class EvaluatePolicyTests(unittest.TestCase):
+    def _policy(self, *rules):
+        return sshfinder.load_policy(_policy_file(self, {"rules": list(rules)}))
+
+    def _checks(self, policy, audit):
+        return [v.check for v in sshfinder.evaluate_policy(policy, audit)]
+
+    def test_password_auth_rule(self):
+        policy = self._policy({"check": "password_auth"})
+        offender = sshfinder.SSHAudit(
+            host="h", port=22, auth_methods=["publickey", "password"]
+        )
+        clean = sshfinder.SSHAudit(
+            host="h", port=22, auth_methods=["publickey"]
+        )
+        self.assertEqual(self._checks(policy, offender), ["password_auth"])
+        self.assertEqual(self._checks(policy, clean), [])
+
+    def test_terrapin_rule(self):
+        policy = self._policy({"check": "terrapin"})
+        vulnerable = sshfinder.SSHAudit(
+            host="h", port=22, terrapin_vulnerable=True
+        )
+        safe = sshfinder.SSHAudit(host="h", port=22, terrapin_vulnerable=False)
+        self.assertEqual(self._checks(policy, vulnerable), ["terrapin"])
+        self.assertEqual(self._checks(policy, safe), [])
+
+    def test_weak_algorithms_rule(self):
+        policy = self._policy({"check": "weak_algorithms"})
+        audit = sshfinder.SSHAudit(
+            host="h", port=22, weaknesses=["weak ciphers: aes128-cbc"]
+        )
+        violations = sshfinder.evaluate_policy(policy, audit)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("aes128-cbc", violations[0].detail)
+
+    def test_post_quantum_rule_ranks_verdicts(self):
+        policy = self._policy({"check": "post_quantum", "require": "ready"})
+        for status, expected in (
+            (sshfinder.PQ_READY, []),
+            (sshfinder.PQ_LEGACY, ["post_quantum"]),
+            (sshfinder.PQ_ABSENT, ["post_quantum"]),
+            (sshfinder.PQ_UNKNOWN, ["post_quantum"]),
+        ):
+            with self.subTest(status=status):
+                audit = sshfinder.SSHAudit(host="h", port=22, pq_status=status)
+                self.assertEqual(self._checks(policy, audit), expected)
+
+    def test_post_quantum_rule_accepts_a_lower_bar(self):
+        """Requiring only 'legacy' passes a pre-standard server."""
+        policy = self._policy({"check": "post_quantum", "require": "legacy"})
+        audit = sshfinder.SSHAudit(
+            host="h", port=22, pq_status=sshfinder.PQ_LEGACY
+        )
+        self.assertEqual(self._checks(policy, audit), [])
+
+    def test_forbid_rule(self):
+        policy = self._policy({
+            "check": "forbid", "field": "ciphers",
+            "algorithms": ["3des-cbc", "arcfour"],
+        })
+        audit = sshfinder.SSHAudit(
+            host="h", port=22, ciphers=["aes256-gcm@openssh.com", "3des-cbc"]
+        )
+        violations = sshfinder.evaluate_policy(policy, audit)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("3des-cbc", violations[0].detail)
+        self.assertNotIn("arcfour", violations[0].detail)
+
+    def test_require_rule(self):
+        policy = self._policy({
+            "check": "require", "field": "kex_algorithms",
+            "algorithms": ["curve25519-sha256", "mlkem768x25519-sha256"],
+        })
+        audit = sshfinder.SSHAudit(
+            host="h", port=22, kex_algorithms=["curve25519-sha256"]
+        )
+        violations = sshfinder.evaluate_policy(policy, audit)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("mlkem768x25519-sha256", violations[0].detail)
+
+    def test_clean_service_has_no_violations(self):
+        policy = sshfinder.load_policy("strict")
+        audit = sshfinder.SSHAudit(
+            host="h", port=22,
+            auth_methods=["publickey"],
+            terrapin_vulnerable=False,
+            pq_status=sshfinder.PQ_READY,
+            host_key_algorithms=["ssh-ed25519"],
+        )
+        self.assertEqual(sshfinder.evaluate_policy(policy, audit), [])
+
+    def test_severity_is_carried_through(self):
+        policy = self._policy(
+            {"check": "terrapin", "severity": "warn"},
+            {"check": "weak_algorithms", "severity": "fail"},
+        )
+        audit = sshfinder.SSHAudit(
+            host="h", port=22, terrapin_vulnerable=True, weaknesses=["bad"]
+        )
+        found = sshfinder.evaluate_policy(policy, audit)
+        severities = {v.check: v.severity for v in found}
+        self.assertEqual(severities["terrapin"], sshfinder.SEVERITY_WARN)
+        self.assertEqual(severities["weak_algorithms"], sshfinder.SEVERITY_FAIL)
+
+
+def _audited(host, port, **audit_kwargs):
+    """A HostResult carrying one audited SSH service."""
+    audit = sshfinder.SSHAudit(host=host, port=port, **audit_kwargs)
+    return sshfinder.HostResult(
+        host=host, open_ports=[port], ssh_ports=[port], audits={port: audit}
+    )
+
+
+def _sample_estate():
+    """Three services: one compliant, one warning-only, one failing."""
+    return [
+        _audited("10.0.0.1", 22, auth_methods=["publickey"],
+                 terrapin_vulnerable=False, pq_status=sshfinder.PQ_READY),
+        _audited("10.0.0.2", 22, auth_methods=["publickey"],
+                 terrapin_vulnerable=False, pq_status=sshfinder.PQ_ABSENT),
+        _audited("10.0.0.3", 22, auth_methods=["password"],
+                 terrapin_vulnerable=True, pq_status=sshfinder.PQ_ABSENT),
+    ]
+
+
+class ApplyPolicyTests(unittest.TestCase):
+    def test_offenders_bucket_by_worst_severity(self):
+        results = _sample_estate()
+        offenders = sshfinder.apply_policy(
+            sshfinder.load_policy("baseline"), results
+        )
+        self.assertEqual(offenders[sshfinder.SEVERITY_FAIL], ["10.0.0.3:22"])
+        self.assertEqual(offenders[sshfinder.SEVERITY_WARN], ["10.0.0.2:22"])
+
+    def test_violations_are_recorded_on_the_audit(self):
+        results = _sample_estate()
+        sshfinder.apply_policy(sshfinder.load_policy("baseline"), results)
+        clean = results[0].audits[22]
+        offender = results[2].audits[22]
+        self.assertEqual(clean.violations, [])
+        self.assertIn("password_auth", [v.check for v in offender.violations])
+        self.assertIn("violations", offender.as_dict())
+        self.assertEqual(
+            offender.as_dict()["violations"][0]["severity"],
+            sshfinder.SEVERITY_FAIL,
+        )
+
+    def test_reevaluation_replaces_rather_than_accumulates(self):
+        results = _sample_estate()
+        policy = sshfinder.load_policy("baseline")
+        sshfinder.apply_policy(policy, results)
+        first = len(results[2].audits[22].violations)
+        sshfinder.apply_policy(policy, results)
+        self.assertEqual(len(results[2].audits[22].violations), first)
+
+
+class PolicyExitCodeTests(unittest.TestCase):
+    def test_clean_estate_passes(self):
+        self.assertEqual(sshfinder.policy_exit_code({}, "fail"), 0)
+
+    def test_failure_gates_by_default(self):
+        offenders = {sshfinder.SEVERITY_FAIL: ["10.0.0.1:22"]}
+        self.assertEqual(
+            sshfinder.policy_exit_code(offenders, "fail"),
+            sshfinder.EXIT_POLICY_VIOLATION,
+        )
+
+    def test_warnings_do_not_gate_by_default(self):
+        offenders = {sshfinder.SEVERITY_WARN: ["10.0.0.1:22"]}
+        self.assertEqual(sshfinder.policy_exit_code(offenders, "fail"), 0)
+
+    def test_fail_on_warn_escalates(self):
+        offenders = {sshfinder.SEVERITY_WARN: ["10.0.0.1:22"]}
+        self.assertEqual(
+            sshfinder.policy_exit_code(offenders, "warn"),
+            sshfinder.EXIT_POLICY_VIOLATION,
+        )
+
+    def test_fail_on_never_reports_without_gating(self):
+        offenders = {sshfinder.SEVERITY_FAIL: ["10.0.0.1:22"]}
+        self.assertEqual(sshfinder.policy_exit_code(offenders, "never"), 0)
+
+
+class PolicyRenderTests(unittest.TestCase):
+    def _estate_report(self, policy_name="baseline"):
+        results = _sample_estate()
+        policy = sshfinder.load_policy(policy_name)
+        offenders = sshfinder.apply_policy(policy, results)
+        return sshfinder.render_policy_report(policy, offenders, results)
+
+    def test_report_counts_and_names_offenders(self):
+        report = self._estate_report()
+        self.assertIn("Policy 'baseline'", report)
+        self.assertIn("1/3 service(s) pass", report)
+        self.assertIn("10.0.0.3:22", report)
+        self.assertIn("password_auth", report)
+
+    def test_listed_service_shows_all_its_violations(self):
+        """A service in the FAIL bucket still needs its warnings fixed."""
+        report = self._estate_report()
+        self.assertIn("terrapin", report)
+        self.assertIn("post_quantum (warn)", report)
+
+    def test_report_without_audits(self):
+        policy = sshfinder.load_policy("pq")
+        report = sshfinder.render_policy_report(
+            policy, {}, [sshfinder.HostResult(host="h")]
+        )
+        self.assertIn("no SSH services were audited", report)
+
+    def test_service_block_marks_severity(self):
+        audit = sshfinder.SSHAudit(
+            host="10.0.0.1", port=22,
+            violations=[
+                sshfinder.Violation(
+                    "terrapin", sshfinder.SEVERITY_FAIL, "boom"
+                ),
+                sshfinder.Violation("post_quantum", sshfinder.SEVERITY_WARN,
+                                    "no PQ"),
+            ],
+        )
+        result = sshfinder.HostResult(
+            host="10.0.0.1", open_ports=[22], ssh_ports=[22], audits={22: audit}
+        )
+        text = sshfinder.render_text([result])
+        self.assertIn("[FAIL] policy/terrapin", text)
+        self.assertIn("[warn] policy/post_quantum", text)
+
+
+class PolicyCLITests(unittest.TestCase):
+    def _serve_kex(self, kex, ciphers=("aes256-gcm@openssh.com",),
+                   macs=("hmac-sha2-256-etm@openssh.com",)):
+        payload = build_kexinit_payload(
+            kex=list(kex), hostkey=["ssh-ed25519"],
+            ciphers=list(ciphers), macs=list(macs),
+        )
+
+        def serve(conn):
+            conn.sendall(b"SSH-2.0-FakeServer_1.0\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        return serve
+
+    def _run(self, port, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = sshfinder.run(["127.0.0.1", "-p", str(port), "-q", *extra])
+        return code, stdout.getvalue()
+
+    def test_defaults(self):
+        args = sshfinder.build_parser().parse_args(["10.0.0.1"])
+        self.assertIsNone(args.policy)
+        self.assertEqual(args.fail_on, sshfinder.SEVERITY_FAIL)
+
+    def test_compliant_service_exits_zero(self):
+        with LoopbackServer(self._serve_kex([MLKEM])) as server:
+            code, report = self._run(server.port, "--policy", "pq")
+        self.assertEqual(code, 0)
+        self.assertIn("1/1 service(s) pass", report)
+
+    def test_violating_service_gates_the_run(self):
+        with LoopbackServer(self._serve_kex(["curve25519-sha256"])) as server:
+            code, report = self._run(server.port, "--policy", "pq")
+        self.assertEqual(code, sshfinder.EXIT_POLICY_VIOLATION)
+        self.assertIn("[FAIL]", report)
+
+    def test_fail_on_never_reports_without_gating(self):
+        with LoopbackServer(self._serve_kex(["curve25519-sha256"])) as server:
+            code, report = self._run(
+                server.port, "--policy", "pq", "--fail-on", "never"
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("[FAIL]", report)  # Still reported, just not gated.
+
+    def test_fail_on_warn_escalates_a_warning(self):
+        path = _policy_file(self, {
+            "rules": [{"check": "post_quantum", "require": "ready",
+                       "severity": "warn"}]
+        })
+        with LoopbackServer(self._serve_kex(["curve25519-sha256"])) as server:
+            lenient, _ = self._run(server.port, "--policy", path)
+            strict, _ = self._run(
+                server.port, "--policy", path, "--fail-on", "warn"
+            )
+        self.assertEqual(lenient, 0)
+        self.assertEqual(strict, sshfinder.EXIT_POLICY_VIOLATION)
+
+    def test_bad_policy_exits_before_scanning(self):
+        path = _policy_file(self, {"rules": [{"check": "nonsense"}]})
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["127.0.0.1", "-p", "22", "--policy", path])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_json_output_carries_violations(self):
+        with LoopbackServer(self._serve_kex(["curve25519-sha256"])) as server:
+            code, out = self._run(server.port, "--policy", "pq", "--json")
+        self.assertEqual(code, sshfinder.EXIT_POLICY_VIOLATION)
+        audit = json.loads(out)[0]["audit"][str(server.port)]
+        self.assertEqual(audit["violations"][0]["check"], "post_quantum")
+
+    def test_crypto_only_policy_needs_no_paramiko(self):
+        """--policy pq must run shallow, so a bare interpreter can gate."""
+        self.assertFalse(sshfinder.load_policy("pq").needs_auth_methods)
+        with LoopbackServer(self._serve_kex([MLKEM])) as server:
+            code, _ = self._run(server.port, "--policy", "pq")
+        self.assertEqual(code, 0)
+
+    def test_audit_report_appends_the_verdict(self):
+        with LoopbackServer(self._serve_kex(["curve25519-sha256"])) as server:
+            code, report = self._run(server.port, "--policy", "pq", "--audit")
+        self.assertEqual(code, sshfinder.EXIT_POLICY_VIOLATION)
+        self.assertIn("=== 127.0.0.1 ===", report)   # Full report, and
+        self.assertIn("Policy 'pq'", report)         # the verdict after it.
+
+
 class LiveKexinitTests(unittest.TestCase):
     def test_read_server_kexinit_live(self):
         """End-to-end raw KEXINIT read against a fake server."""

@@ -1,7 +1,7 @@
 # sshfinder
 
 [![CI](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/kabiri-labs/sshfinder/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-2.6.0-blue)
+![version](https://img.shields.io/badge/version-2.7.0-blue)
 
 `sshfinder` is a fast, reliable tool for discovering open **SSH** services
 across one or many targets. It scans for open TCP ports and then confirms
@@ -51,6 +51,13 @@ speed.
   It also separates services offering **pre-standard** hybrids (the withdrawn
   `sntrup4591761`, Kyber drafts) — these look post-quantum in an algorithm
   dump but negotiate classical crypto with every current client.
+- **Policy gate (`--policy`)** — check every SSH service against a baseline
+  and **exit non-zero on violation**, so a scan can gate CI or a scheduled
+  job. Ships with `baseline`, `strict` and `pq` built in, or takes a JSON
+  policy of your own. Rules carry a `fail`/`warn` severity, and `--fail-on`
+  decides which one gates. An unrecognised check, field or severity is a
+  hard error, never a silently skipped rule — a typo must not turn a failing
+  estate green.
 - **Zero required dependencies** — the default connect scan and banner
   validation run on the Python standard library alone.
 - **Bounded by design** — a process-wide socket budget derived from the
@@ -117,6 +124,9 @@ python sshfinder.py [targets ...] [options]
 | `--validate {banner,paramiko,none}` | SSH validation strategy (default: `banner`). |
 | `--audit` | Audit each SSH service (algorithms, host key, auth methods, Terrapin, post-quantum readiness, shared-key correlation). |
 | `--pq-report` | Report post-quantum key exchange readiness across the estate. Reads only the KEXINIT — no third-party library needed. |
+| `--policy NAME_OR_PATH` | Check each SSH service against a policy (`baseline`, `strict`, `pq`, or a JSON file) and exit `3` on violation. |
+| `--fail-on {fail,warn,never}` | Which policy severity gates the exit code (default: `fail`). |
+
 | `-t, --timeout SECONDS` | Longest a probe may wait (default: `2.0`). |
 | `--min-timeout SECONDS` | Floor for the adaptive probe timeout (default: `0.1`). |
 | `--no-adaptive-timeout` | Wait the full `--timeout` on every probe instead of adapting to the measured round-trip time. |
@@ -132,6 +142,20 @@ python sshfinder.py [targets ...] [options]
 | `--no-progress` | Disable the live progress indicator. |
 | `-v` | Verbose (debug) logging. |
 | `-q, --quiet` | Suppress progress and informational logging. |
+
+### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0` | Success. Nothing found is still success — an empty estate is not an error. |
+| `1` | Hard error: every target failed to scan, or the output file could not be written. |
+| `2` | Bad invocation (unknown flag, invalid port spec, malformed policy). |
+| `3` | Policy violation at or above `--fail-on`. Only ever returned with `--policy`. |
+| `130` | Interrupted with Ctrl+C. |
+
+A hard error outranks a policy verdict: if nothing was reachable, the scan
+proved nothing about compliance either way, so you get `1` rather than a
+misleading pass or fail.
 
 > **Note on slow scans.** A full `1-65535` sweep of a firewalled host still
 > has to wait out a timeout per filtered port. Four things keep that from
@@ -215,6 +239,51 @@ Post-quantum readiness:
         10.0.0.3:22
   2 service(s) exposed to store-now-decrypt-later capture; upgrade to OpenSSH 9.0+ (10.0+ preferred)
 ```
+
+Gate a CI job or a scheduled scan on a baseline — exits `3` if any service
+violates it:
+
+```bash
+python sshfinder.py 10.0.0.0/24 -p 22,2222 --policy baseline
+```
+
+```
+Policy 'baseline':
+  No password login, no Terrapin exposure, no weak algorithms.
+  1/3 service(s) pass
+  [FAIL] 1 service(s):
+        10.0.0.3:22
+          - password_auth: password login accepted: publickey, password
+          - terrapin: vulnerable to Terrapin (CVE-2023-48795)
+          - post_quantum (warn): post-quantum readiness is absent, ready required
+  [warn] 1 service(s):
+        10.0.0.2:22
+          - post_quantum (warn): post-quantum readiness is absent, ready required
+```
+
+Write your own policy as JSON:
+
+```json
+{
+  "name": "house-rules",
+  "description": "What we expect of every SSH service.",
+  "rules": [
+    {"check": "password_auth", "severity": "fail"},
+    {"check": "terrapin", "severity": "fail"},
+    {"check": "post_quantum", "require": "ready", "severity": "warn"},
+    {"check": "forbid", "field": "ciphers",
+     "algorithms": ["3des-cbc", "arcfour"], "severity": "fail"},
+    {"check": "require", "field": "kex_algorithms",
+     "algorithms": ["curve25519-sha256"], "severity": "fail"}
+  ]
+}
+```
+
+Available checks: `password_auth`, `terrapin`, `weak_algorithms`,
+`post_quantum` (with `require`: `ready`, `legacy`, `absent`), and
+`forbid` / `require` over a `field` of `kex_algorithms`,
+`host_key_algorithms`, `ciphers` or `macs`. Anything else is rejected when
+the policy loads.
 
 Example audit output:
 
