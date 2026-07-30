@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import errno
 import hashlib
+import io
 import ipaddress
 import json
 import logging
@@ -48,7 +50,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -165,6 +167,25 @@ DRIFT_INFO = "info"          # Changed, but neither better nor worse.
 DRIFT_CATEGORIES = (
     DRIFT_ALERT, DRIFT_ADDED, DRIFT_REMOVED, DRIFT_IMPROVED, DRIFT_INFO,
 )
+
+# Output formats. "json" stays the name of the native report so --json keeps
+# meaning what it always did.
+FORMAT_TEXT = "text"
+FORMAT_JSON = "json"
+FORMAT_SARIF = "sarif"
+FORMAT_CSV = "csv"
+OUTPUT_FORMATS = (FORMAT_TEXT, FORMAT_JSON, FORMAT_SARIF, FORMAT_CSV)
+
+SARIF_VERSION = "2.1.0"
+SARIF_SCHEMA = (
+    "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/"
+    "sarif-2.1/schema/sarif-schema-2.1.0.json"
+)
+PROJECT_URL = "https://github.com/kabiri-labs/sshfinder"
+# SARIF severity levels.
+SARIF_ERROR = "error"
+SARIF_WARNING = "warning"
+SARIF_NOTE = "note"
 
 # Algorithm inventories a forbid/require rule may name.
 POLICY_FIELDS = {
@@ -2869,6 +2890,237 @@ def render_json(results: list[HostResult]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Interchange formats
+# --------------------------------------------------------------------------- #
+# Findings this tool can raise on its own, and how severe each is. Declared up
+# front so a SARIF consumer sees a stable rule catalogue rather than rules that
+# blink in and out depending on what a given scan happened to find.
+SARIF_RULES = {
+    "weak-algorithms": (
+        SARIF_ERROR,
+        "Weak or deprecated SSH algorithms offered",
+        "The server advertises key exchange, cipher, MAC or host key "
+        "algorithms that are considered broken or deprecated.",
+    ),
+    "terrapin": (
+        SARIF_ERROR,
+        "Vulnerable to Terrapin (CVE-2023-48795)",
+        "The server offers a mode affected by the Terrapin prefix-truncation "
+        "attack without advertising the strict key exchange countermeasure.",
+    ),
+    "password-auth": (
+        SARIF_WARNING,
+        "Password authentication accepted",
+        "The server accepts a password-style login, which can be brute "
+        "forced. Prefer public key authentication only.",
+    ),
+    "post-quantum": (
+        SARIF_WARNING,
+        "No post-quantum key exchange",
+        "The server cannot negotiate post-quantum key agreement with a "
+        "current client, so sessions are exposed to store-now-decrypt-later "
+        "capture.",
+    ),
+}
+_POLICY_RULE_PREFIX = "policy/"
+_SARIF_LEVEL_FOR_SEVERITY = {
+    SEVERITY_FAIL: SARIF_ERROR,
+    SEVERITY_WARN: SARIF_WARNING,
+}
+
+
+def _sarif_finding(audit: SSHAudit) -> Iterator[tuple]:
+    """Yield ``(rule_id, level, message)`` for one service's own findings."""
+    if audit.weaknesses:
+        yield "weak-algorithms", SARIF_ERROR, "; ".join(audit.weaknesses)
+    if audit.terrapin_vulnerable:
+        yield "terrapin", SARIF_ERROR, "vulnerable to Terrapin (CVE-2023-48795)"
+    if audit.password_auth:
+        yield (
+            "password-auth", SARIF_WARNING,
+            "password login accepted: " + ", ".join(audit.auth_methods),
+        )
+    if audit.pq_status in (PQ_ABSENT, PQ_LEGACY):
+        detail = (
+            "no post-quantum key exchange offered"
+            if audit.pq_status == PQ_ABSENT
+            else "only pre-standard post-quantum key exchange offered: "
+            + ", ".join(audit.pq_kex)
+        )
+        yield "post-quantum", SARIF_WARNING, detail
+
+
+def _sarif_results(results: list[HostResult], policed: bool) -> list[tuple]:
+    """Collect ``(socket, rule_id, level, message)`` for the whole scan.
+
+    When a policy ran, its violations *are* the findings: reporting both would
+    say the same thing twice under two different rule names.
+    """
+    collected: list[tuple] = []
+    for result in results:
+        for port in sorted(result.audits):
+            audit = result.audits[port]
+            socket_str = f"{result.host}:{port}"
+            if policed:
+                for violation in audit.violations:
+                    collected.append((
+                        socket_str,
+                        _POLICY_RULE_PREFIX + violation.check,
+                        _SARIF_LEVEL_FOR_SEVERITY.get(
+                            violation.severity, SARIF_WARNING
+                        ),
+                        violation.detail,
+                    ))
+            else:
+                for rule_id, level, message in _sarif_finding(audit):
+                    collected.append((socket_str, rule_id, level, message))
+    return collected
+
+
+def _sarif_rule(rule_id: str, level: str) -> dict:
+    """Describe one rule for the tool's driver."""
+    if rule_id in SARIF_RULES:
+        _, title, description = SARIF_RULES[rule_id]
+    else:
+        check = rule_id[len(_POLICY_RULE_PREFIX):]
+        title = f"Policy check '{check}' failed"
+        description = (
+            f"The service violates the '{check}' rule of the policy this scan "
+            "was run against."
+        )
+    return {
+        "id": rule_id,
+        "name": rule_id.replace("/", "-").replace("_", "-"),
+        "shortDescription": {"text": title},
+        "fullDescription": {"text": description},
+        "defaultConfiguration": {"level": level},
+        "helpUri": PROJECT_URL,
+    }
+
+
+def render_sarif(results: list[HostResult], policed: bool = False) -> str:
+    """Render findings as SARIF 2.1.0.
+
+    A network service has no source file, so each finding is anchored by a
+    ``logicalLocation`` naming the socket -- which is what the specification
+    provides for results that are not tied to an artifact. A synthetic
+    ``ssh://host:port`` physical location is emitted alongside it because
+    GitHub's SARIF uploader rejects a result whose artifact location is empty;
+    it will not resolve to a file in the repository, so the alert appears
+    without a code anchor.
+
+    ``partialFingerprints`` are derived from the socket and the rule, so a
+    consumer tracks the same finding across runs instead of opening a fresh
+    alert every night.
+    """
+    collected = _sarif_results(results, policed)
+    levels = {}
+    for _socket, rule_id, level, _message in collected:
+        levels.setdefault(rule_id, level)
+    for rule_id, (level, _title, _description) in SARIF_RULES.items():
+        levels.setdefault(rule_id, level)
+
+    rules = [_sarif_rule(rule_id, level) for rule_id, level in
+             sorted(levels.items())]
+    index_of = {rule["id"]: position for position, rule in enumerate(rules)}
+
+    sarif_results = []
+    for socket_str, rule_id, level, message in collected:
+        digest = hashlib.sha256(
+            f"{socket_str}\0{rule_id}".encode("utf-8")
+        ).hexdigest()
+        sarif_results.append({
+            "ruleId": rule_id,
+            "ruleIndex": index_of[rule_id],
+            "level": level,
+            "message": {"text": f"{socket_str}: {message}"},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": f"ssh://{socket_str}"},
+                },
+                "logicalLocations": [{
+                    "name": socket_str,
+                    "fullyQualifiedName": socket_str,
+                    "kind": "resource",
+                }],
+            }],
+            "partialFingerprints": {"sshfinderFinding/v1": digest},
+        })
+
+    return json.dumps({
+        "$schema": SARIF_SCHEMA,
+        "version": SARIF_VERSION,
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "sshfinder",
+                    "version": __version__,
+                    "informationUri": PROJECT_URL,
+                    "rules": rules,
+                }
+            },
+            "results": sarif_results,
+        }],
+    }, indent=2)
+
+
+CSV_COLUMNS = (
+    "host", "port", "banner", "server_version", "host_key_type",
+    "host_key_fingerprint", "auth_methods", "password_auth",
+    "terrapin_vulnerable", "pq_status", "pq_kex", "weaknesses",
+    "violations", "rtt_ms",
+)
+
+
+def render_csv(results: list[HostResult]) -> str:
+    """Render one row per confirmed SSH service, for a spreadsheet.
+
+    Hosts with no SSH service produce no row: this is an inventory of SSH
+    services, and a machine that does not run one is not an entry in it.
+    List-valued columns are joined with '; ' so a cell stays readable.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(CSV_COLUMNS)
+    for result in results:
+        for port in sorted(result.ssh_ports):
+            audit = result.audits.get(port)
+            writer.writerow([
+                result.host,
+                port,
+                result.banners.get(port, ""),
+                audit.server_version if audit else "",
+                audit.host_key_type if audit else "",
+                audit.host_key_fingerprint if audit else "",
+                "; ".join(audit.auth_methods) if audit else "",
+                # password_auth is derived from auth_methods, so it reads
+                # False when the deep probe never ran. Leave the cell empty
+                # rather than let a spreadsheet filter count "unknown" as
+                # "no password login".
+                _csv_bool(
+                    audit.password_auth
+                    if audit and audit.auth_methods else None
+                ),
+                _csv_bool(audit.terrapin_vulnerable if audit else None),
+                audit.pq_status if audit else "",
+                "; ".join(audit.pq_kex) if audit else "",
+                "; ".join(audit.weaknesses) if audit else "",
+                "; ".join(
+                    f"{v.severity}:{v.check}" for v in audit.violations
+                ) if audit else "",
+                "" if result.rtt_ms is None else result.rtt_ms,
+            ])
+    return buffer.getvalue().rstrip("\n")
+
+
+def _csv_bool(value: Optional[bool]) -> str:
+    """Render a tristate as text, so "unknown" never reads as "no"."""
+    if value is None:
+        return ""
+    return "true" if value else "false"
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -3007,9 +3259,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Retries for timed-out probes (default: {DEFAULT_RETRIES}).",
     )
     parser.add_argument(
+        "--format",
+        choices=OUTPUT_FORMATS,
+        default=None,
+        help=f"Output format (default: {FORMAT_TEXT}). 'sarif' emits SARIF "
+        "2.1.0 findings; 'csv' emits one row per confirmed SSH service.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
-        help="Emit results as JSON.",
+        help="Shorthand for --format json.",
     )
     parser.add_argument(
         "--stream",
@@ -3098,6 +3357,15 @@ def run(argv: Optional[list[str]] = None) -> int:
         parser.error("max-targets must be >= 1")
     if args.max_sockets < 0:
         parser.error("max-sockets must be >= 0")
+
+    # --json predates --format and stays a shorthand for it. Asking for two
+    # different formats at once has no sensible reading, so say so rather than
+    # silently picking one.
+    if args.json and args.format not in (None, FORMAT_JSON):
+        parser.error(
+            f"--json conflicts with --format {args.format}; pass only one"
+        )
+    output_format = args.format or (FORMAT_JSON if args.json else FORMAT_TEXT)
 
     try:
         hosts = expand_targets(tokens, max_targets=args.max_targets)
@@ -3207,8 +3475,12 @@ def run(argv: Optional[list[str]] = None) -> int:
     if baseline is not None:
         changes = diff_against_baseline(baseline, results)
 
-    if args.json:
+    if output_format == FORMAT_JSON:
         output = render_json(results)
+    elif output_format == FORMAT_SARIF:
+        output = render_sarif(results, policed=policy is not None)
+    elif output_format == FORMAT_CSV:
+        output = render_csv(results)
     elif baseline is not None and not (args.audit or policy or args.pq_report):
         # Asked what changed, so answer that and nothing else.
         output = render_drift_report(baseline, changes)
