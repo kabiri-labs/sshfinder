@@ -120,6 +120,63 @@ def _serve_http(conn):
     conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
 
 
+class BlackholePort:
+    """A loopback port that silently drops connection attempts.
+
+    Saturating a listen backlog makes the kernel discard further SYNs instead
+    of answering them, which is a deterministic stand-in for a firewalled port
+    -- no network, no fixtures, no waiting on a real unreachable host. Not
+    every platform overflows this way, so call :meth:`drops_syns` and skip
+    when it does not.
+    """
+
+    def __init__(self, saturation=20, settle=0.3):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)  # Tiny queue, never accepted from.
+        self.port = self._sock.getsockname()[1]
+        self._held = []
+        for _ in range(saturation):
+            filler = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            filler.setblocking(False)
+            filler.connect_ex(("127.0.0.1", self.port))
+            self._held.append(filler)
+        time.sleep(settle)
+
+    def drops_syns(self, timeout=0.5):
+        """True if a connection attempt really does hang rather than answer."""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(timeout)
+        try:
+            probe.connect(("127.0.0.1", self.port))
+            return False
+        except socket.timeout:
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    def close(self):
+        for filler in self._held:
+            try:
+                filler.close()
+            except OSError:
+                pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 class SSHServerMixin:
     """Provides ``self.ssh_port``, an open port speaking an SSH banner."""
 
@@ -775,6 +832,180 @@ class SocketBudgetTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Adaptive probe timeout
+# --------------------------------------------------------------------------- #
+class AdaptiveTimeoutTests(unittest.TestCase):
+    def test_starts_at_the_ceiling(self):
+        timer = sshfinder.AdaptiveTimeout(2.0)
+        self.assertEqual(timer.value(), 2.0)
+        self.assertIsNone(timer.rtt)
+
+    def test_first_sample_seeds_mean_and_deviation(self):
+        timer = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        timer.observe(0.010)
+        # RFC 6298: srtt = R, rttvar = R/2, so rto = R + 4*(R/2) = 3R.
+        self.assertAlmostEqual(timer.value(), 0.030, places=6)
+        self.assertAlmostEqual(timer.rtt, 0.010, places=6)
+
+    def test_converges_towards_a_steady_round_trip(self):
+        timer = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        for _ in range(60):
+            timer.observe(0.020)
+        self.assertAlmostEqual(timer.rtt, 0.020, places=3)
+        # Deviation decays to nothing, so the timeout approaches the mean.
+        self.assertLess(timer.value(), 0.025)
+        self.assertGreater(timer.value(), 0.020)
+
+    def test_jitter_widens_the_allowance(self):
+        steady = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        jittery = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        for index in range(40):
+            steady.observe(0.020)
+            jittery.observe(0.005 if index % 2 else 0.035)
+        self.assertGreater(jittery.value(), steady.value())
+
+    def test_never_leaves_the_floor_ceiling_band(self):
+        timer = sshfinder.AdaptiveTimeout(1.0, floor=0.25)
+        timer.observe(0.0001)
+        self.assertEqual(timer.value(), 0.25)
+        for _ in range(20):
+            timer.observe(5.0)  # Clamped to the ceiling on the way in.
+        self.assertLessEqual(timer.value(), 1.0)
+
+    def test_floor_is_capped_by_the_ceiling(self):
+        timer = sshfinder.AdaptiveTimeout(0.05, floor=1.0)
+        self.assertEqual(timer.floor, 0.05)
+
+    def test_disabled_always_returns_the_ceiling(self):
+        timer = sshfinder.AdaptiveTimeout(2.0, floor=0.01, enabled=False)
+        timer.observe(0.001)
+        self.assertEqual(timer.value(), 2.0)
+        self.assertIsNotNone(timer.rtt)  # Still measured, just not applied.
+
+    def test_derived_estimator_starts_from_the_pool(self):
+        pool = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        pool.observe(0.010)
+        derived = pool.derive()
+        self.assertAlmostEqual(derived.rtt, 0.010, places=6)
+        self.assertEqual(derived.ceiling, pool.ceiling)
+        self.assertEqual(derived.floor, pool.floor)
+        self.assertEqual(derived.enabled, pool.enabled)
+
+    def test_derived_estimator_reports_back_to_the_pool(self):
+        pool = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+        pool.derive().observe(0.010)
+        self.assertAlmostEqual(pool.rtt, 0.010, places=6)
+
+    def test_pool_is_safe_under_concurrent_observation(self):
+        pool = sshfinder.AdaptiveTimeout(2.0, floor=0.001)
+
+        def hammer():
+            for _ in range(500):
+                pool.derive().observe(0.010)
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertAlmostEqual(pool.rtt, 0.010, places=4)
+
+    def test_an_unmeasured_pool_seeds_nothing(self):
+        self.assertIsNone(sshfinder.AdaptiveTimeout(2.0).derive().rtt)
+
+
+class AdaptiveSweepTests(SSHServerMixin, unittest.TestCase):
+    def test_sweep_measures_the_round_trip(self):
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [self.ssh_port, 1], timeout=1.0, max_inflight=4
+        )
+        self.assertIsNotNone(outcome.rtt)
+        self.assertGreaterEqual(outcome.rtt, 0.0)
+        self.assertLess(outcome.rtt, 1.0)
+
+    def test_host_result_carries_the_round_trip(self):
+        result = sshfinder.scan_host(
+            "127.0.0.1",
+            [self.ssh_port],
+            scan_method="connect",
+            validate="banner",
+            timeout=1.0,
+            workers=4,
+            retries=0,
+            rtt_pool=sshfinder.AdaptiveTimeout(1.0),
+        )
+        self.assertIsNotNone(result.rtt_ms)
+        self.assertIn("rtt_ms", result.as_dict())
+
+    def test_scan_host_reports_into_the_shared_pool(self):
+        pool = sshfinder.AdaptiveTimeout(1.0, floor=0.001)
+        sshfinder.scan_host(
+            "127.0.0.1",
+            [self.ssh_port],
+            scan_method="connect",
+            validate="none",
+            timeout=1.0,
+            workers=4,
+            retries=0,
+            rtt_pool=pool,
+        )
+        self.assertIsNotNone(pool.rtt)
+
+
+class DroppedProbeTests(unittest.TestCase):
+    """Behaviour against a port that answers nothing at all."""
+
+    def setUp(self):
+        self.hole = BlackholePort()
+        self.addCleanup(self.hole.close)
+        if not self.hole.drops_syns():
+            self.skipTest("platform answers instead of dropping on overflow")
+
+    def test_timeouts_do_not_feed_the_estimate(self):
+        """Only answers measure the path; silence must teach nothing."""
+        timer = sshfinder.AdaptiveTimeout(0.3, floor=0.05)
+        # A refused port is a real round trip, so it sets the estimate.
+        sshfinder._connect_sweep(
+            "127.0.0.1", [1], timeout=0.3, max_inflight=2, timer=timer
+        )
+        measured = timer.rtt
+        self.assertIsNotNone(measured)
+        # A sweep that only times out must leave the estimate exactly as it was.
+        sshfinder._connect_sweep(
+            "127.0.0.1", [self.hole.port], timeout=0.3, max_inflight=2,
+            timer=timer,
+        )
+        self.assertEqual(timer.rtt, measured)
+
+    def test_dropped_probe_is_reported_filtered(self):
+        outcome = sshfinder._connect_sweep(
+            "127.0.0.1", [self.hole.port], timeout=0.3, max_inflight=2,
+            timer=sshfinder.AdaptiveTimeout(0.3, floor=0.05),
+        )
+        self.assertEqual(outcome.open_ports, [])
+        self.assertEqual(outcome.filtered, 1)
+
+    def test_adapting_shortens_a_sweep_that_waits_on_silence(self):
+        """The whole point: fast answers must buy a shorter wait on silence."""
+        ports = [self.hole.port] + list(range(1, 6))  # 1 silent, 5 refusing
+
+        def elapsed(enabled):
+            timer = sshfinder.AdaptiveTimeout(
+                1.0, floor=0.05, enabled=enabled
+            )
+            start = time.monotonic()
+            sshfinder._connect_sweep(
+                "127.0.0.1", ports, timeout=1.0, max_inflight=16, timer=timer
+            )
+            return time.monotonic() - start
+
+        fixed = elapsed(False)
+        adaptive = elapsed(True)
+        self.assertGreater(fixed, 0.8)      # Waited out the full ceiling.
+        self.assertLess(adaptive, fixed / 2)
+
+
+# --------------------------------------------------------------------------- #
 # The unresponsive-host gate
 # --------------------------------------------------------------------------- #
 class UnresponsiveGateTests(unittest.TestCase):
@@ -868,7 +1099,7 @@ class SweepPassAbortTests(unittest.TestCase):
         _timed_out, unresolved = sshfinder._sweep_pass(
             endpoint,
             list(range(1, 200)),
-            timeout=1.0,
+            timer=sshfinder.AdaptiveTimeout(1.0, enabled=False),
             max_inflight=4,
             budget=budget,
             on_result=lambda port, status, sock: False,
@@ -1233,26 +1464,36 @@ class EventStreamTests(unittest.TestCase):
 class CLITests(unittest.TestCase):
     def test_new_flags_are_accepted(self):
         args = sshfinder.build_parser().parse_args(
-            ["10.0.0.1", "--stream", "--no-early-exit",
-             "--max-sockets", "128", "--max-targets", "10"]
+            ["10.0.0.1", "--stream", "--no-early-exit", "--max-sockets", "128",
+             "--max-targets", "10", "--no-adaptive-timeout",
+             "--min-timeout", "0.25"]
         )
         self.assertTrue(args.stream)
         self.assertTrue(args.no_early_exit)
+        self.assertTrue(args.no_adaptive_timeout)
         self.assertEqual(args.max_sockets, 128)
         self.assertEqual(args.max_targets, 10)
+        self.assertEqual(args.min_timeout, 0.25)
 
     def test_defaults(self):
         args = sshfinder.build_parser().parse_args(["10.0.0.1"])
         self.assertFalse(args.stream)
         self.assertFalse(args.no_early_exit)
+        self.assertFalse(args.no_adaptive_timeout)
         self.assertEqual(args.max_targets, sshfinder.DEFAULT_MAX_TARGETS)
+        self.assertEqual(args.min_timeout, sshfinder.DEFAULT_MIN_TIMEOUT)
 
     def test_negative_limits_are_rejected(self):
-        for flag in ("--max-targets", "--max-sockets"):
+        for flag in ("--max-targets", "--max-sockets", "--min-timeout"):
             with self.subTest(flag=flag):
                 with self.assertRaises(SystemExit):
                     with contextlib.redirect_stderr(io.StringIO()):
                         sshfinder.run(["10.0.0.1", flag, "-1"])
+
+    def test_min_timeout_above_timeout_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                sshfinder.run(["10.0.0.1", "-t", "1", "--min-timeout", "5"])
 
     def test_stream_mode_emits_only_jsonl(self):
         with LoopbackServer(_serve_ssh_banner) as server:
