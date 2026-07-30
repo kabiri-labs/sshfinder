@@ -526,6 +526,189 @@ class AssessWeaknessesTests(unittest.TestCase):
         self.assertEqual(sshfinder.assess_weaknesses(kex), [])
 
 
+class AssessAlgorithmTests(unittest.TestCase):
+    """The table every verdict in this tool ultimately rests on."""
+
+    def _severity(self, name):
+        finding = sshfinder.assess_algorithm(name)
+        return finding.severity if finding else None
+
+    def test_broken_algorithms_are_critical(self):
+        for name in (
+            "diffie-hellman-group1-sha1", "rsa1024-sha1", "none", "arcfour",
+            "arcfour128", "arcfour256", "des-cbc", "3des-cbc", "blowfish-cbc",
+            "cast128-cbc", "hmac-md5", "hmac-md5-96", "ssh-dss",
+            "x509v3-ssh-dss",
+        ):
+            with self.subTest(algorithm=name):
+                self.assertEqual(
+                    self._severity(name), sshfinder.ALGORITHM_CRITICAL
+                )
+
+    def test_deprecated_algorithms_are_weak(self):
+        for name in (
+            "diffie-hellman-group14-sha1", "aes128-cbc", "aes256-cbc",
+            "hmac-sha1", "hmac-sha1-96", "hmac-ripemd160", "umac-64",
+            "ssh-rsa", "ssh-rsa-cert-v01@openssh.com", "x509v3-sign-rsa",
+        ):
+            with self.subTest(algorithm=name):
+                self.assertEqual(
+                    self._severity(name), sshfinder.ALGORITHM_WEAK
+                )
+
+    def test_modern_algorithms_are_clean(self):
+        for name in (
+            "curve25519-sha256", "curve25519-sha256@libssh.org",
+            "mlkem768x25519-sha256", "sntrup761x25519-sha512@openssh.com",
+            "ecdh-sha2-nistp256", "diffie-hellman-group14-sha256",
+            "aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com",
+            "hmac-sha2-256", "hmac-sha2-512-etm@openssh.com",
+            "umac-128-etm@openssh.com", "ssh-ed25519", "rsa-sha2-256",
+            "rsa-sha2-512", "sk-ssh-ed25519@openssh.com",
+        ):
+            with self.subTest(algorithm=name):
+                self.assertIsNone(sshfinder.assess_algorithm(name))
+
+    def test_vendor_suffix_cannot_smuggle_an_algorithm_past(self):
+        """The bug a plain endswith('-cbc') check had."""
+        for name in ("rijndael-cbc@lysator.liu.se", "seed-cbc@ssh.com",
+                     "aes128-cbc@example.invalid"):
+            with self.subTest(algorithm=name):
+                self.assertEqual(
+                    self._severity(name), sshfinder.ALGORITHM_WEAK
+                )
+
+    def test_encrypt_then_mac_marker_does_not_hide_a_weak_mac(self):
+        for name in ("hmac-sha1-etm@openssh.com",
+                     "hmac-md5-etm@openssh.com",
+                     "hmac-ripemd160-etm@openssh.com"):
+            with self.subTest(algorithm=name):
+                self.assertIsNotNone(sshfinder.assess_algorithm(name))
+
+    def test_negotiation_markers_are_not_algorithms(self):
+        """Flagging a server for advertising a countermeasure is absurd."""
+        for name in ("ext-info-s", "ext-info-c",
+                     "kex-strict-s-v00@openssh.com",
+                     "kex-strict-c-v00@openssh.com"):
+            with self.subTest(algorithm=name):
+                self.assertIsNone(sshfinder.assess_algorithm(name))
+
+    def test_case_is_ignored(self):
+        self.assertEqual(
+            self._severity("AES128-CBC"), sshfinder.ALGORITHM_WEAK
+        )
+
+    def test_empty_name_is_ignored(self):
+        self.assertIsNone(sshfinder.assess_algorithm(""))
+
+    def test_every_finding_carries_a_reason(self):
+        for name, finding in sshfinder.ALGORITHM_TABLE.items():
+            with self.subTest(algorithm=name):
+                self.assertIn(
+                    finding.severity,
+                    (sshfinder.ALGORITHM_CRITICAL, sshfinder.ALGORITHM_WEAK),
+                )
+                self.assertTrue(finding.reason.strip())
+
+    def test_normalisation(self):
+        self.assertEqual(
+            sshfinder.normalise_algorithm("HMAC-SHA1-ETM@openssh.com"),
+            "hmac-sha1",
+        )
+        self.assertEqual(
+            sshfinder.normalise_algorithm("aes256-gcm@openssh.com"),
+            "aes256-gcm",
+        )
+
+
+class WeaknessReportingTests(unittest.TestCase):
+    def _kex(self, kex=(), hostkey=(), ciphers=(), macs=()):
+        return sshfinder.parse_kexinit(build_kexinit_payload(
+            kex=list(kex) or ["curve25519-sha256"],
+            hostkey=list(hostkey) or ["ssh-ed25519"],
+            ciphers=list(ciphers) or ["aes256-gcm@openssh.com"],
+            macs=list(macs) or ["hmac-sha2-256-etm@openssh.com"],
+        ))
+
+    def test_finding_wording_is_stable(self):
+        """These strings live in --json and are compared by --baseline.
+
+        Rephrasing them would make every service look like its crypto had
+        changed on the first scan after an upgrade.
+        """
+        findings = sshfinder.assess_weaknesses(self._kex(
+            kex=["diffie-hellman-group1-sha1"], hostkey=["ssh-rsa"],
+            ciphers=["aes128-cbc"], macs=["hmac-md5"],
+        ))
+        self.assertEqual(findings, [
+            "weak key exchange: diffie-hellman-group1-sha1",
+            "weak host key alg: ssh-rsa",
+            "weak ciphers: aes128-cbc",
+            "weak MACs: hmac-md5",
+        ])
+
+    def test_clean_server_reports_nothing(self):
+        self.assertEqual(sshfinder.assess_weaknesses(self._kex()), [])
+
+    def test_previously_missed_algorithms_are_now_caught(self):
+        findings = sshfinder.assess_weaknesses(self._kex(
+            ciphers=["rijndael-cbc@lysator.liu.se"], macs=["hmac-ripemd160"],
+        ))
+        self.assertIn("weak ciphers: rijndael-cbc@lysator.liu.se", findings)
+        self.assertIn("weak MACs: hmac-ripemd160", findings)
+
+    def test_reasons_explain_each_flagged_algorithm(self):
+        reasons = sshfinder.explain_weaknesses(self._kex(
+            ciphers=["aes128-cbc"], macs=["hmac-md5"],
+        ))
+        joined = " ".join(reasons)
+        self.assertIn("aes128-cbc [weak]", joined)
+        self.assertIn("CVE-2008-5161", joined)
+        self.assertIn("hmac-md5 [critical]", joined)
+
+    def test_reasons_do_not_repeat_an_algorithm(self):
+        """The same cipher appears in both directions of the KEXINIT."""
+        reasons = sshfinder.explain_weaknesses(
+            self._kex(ciphers=["aes128-cbc"])
+        )
+        self.assertEqual(len(reasons), 1)
+
+    def test_reasons_are_silent_on_a_clean_server(self):
+        self.assertEqual(sshfinder.explain_weaknesses(self._kex()), [])
+
+    def test_audit_carries_both_findings_and_reasons(self):
+        payload = build_kexinit_payload(
+            kex=["curve25519-sha256"], hostkey=["ssh-ed25519"],
+            ciphers=["aes128-cbc"], macs=["hmac-sha2-256"],
+        )
+
+        def serve(conn):
+            conn.sendall(b"SSH-2.0-FakeServer_1.0\r\n")
+            conn.sendall(packetize(payload))
+            conn.recv(64)
+
+        with LoopbackServer(serve) as server:
+            audit = sshfinder.audit_ssh_service(
+                "127.0.0.1", server.port, 2.0, deep=False
+            )
+        self.assertEqual(audit.weaknesses, ["weak ciphers: aes128-cbc"])
+        self.assertTrue(audit.weakness_reasons)
+        self.assertIn("weakness_reasons", audit.as_dict())
+
+    def test_text_report_shows_the_reason(self):
+        audit = sshfinder.SSHAudit(
+            host="10.0.0.1", port=22,
+            weaknesses=["weak ciphers: aes128-cbc"],
+            weakness_reasons=["aes128-cbc [weak]: CBC mode is bad"],
+        )
+        result = sshfinder.HostResult(
+            host="10.0.0.1", open_ports=[22], ssh_ports=[22], audits={22: audit}
+        )
+        text = sshfinder.render_text([result])
+        self.assertIn("weak ciphers: aes128-cbc", text)
+        self.assertIn("CBC mode is bad", text)
+
+
 class TerrapinTests(unittest.TestCase):
     def test_vulnerable_with_chacha_and_no_strict_kex(self):
         kex = sshfinder.parse_kexinit(
