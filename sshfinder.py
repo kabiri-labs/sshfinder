@@ -50,7 +50,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
-__version__ = "2.10.0"
+__version__ = "2.11.0"
 
 LOGGER = logging.getLogger("sshfinder")
 
@@ -673,6 +673,69 @@ class SocketBudget:
             return self.capacity
 
 
+class RateLimiter:
+    """Token bucket capping how many probes leave per second.
+
+    Concurrency limits how many connections are open at once; it does not
+    limit how fast new ones are started. On a quiet network that distinction
+    does not matter, but a scan of production has to be able to promise a
+    ceiling on the traffic it generates -- which is what makes it acceptable
+    to run under rules of engagement at all.
+
+    A small burst is allowed so the bucket does not serialise the very first
+    probes of a scan into a lockstep trickle.
+    """
+
+    def __init__(self, rate: float, burst: Optional[float] = None):
+        self.rate = max(0.001, rate)
+        self.capacity = max(1.0, burst if burst is not None else self.rate)
+        self._tokens = self.capacity
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self, now: float) -> None:
+        elapsed = now - self._updated
+        if elapsed > 0:
+            self._tokens = min(
+                self.capacity, self._tokens + elapsed * self.rate
+            )
+            self._updated = now
+
+    def acquire(self) -> bool:
+        """Spend one token. Returns False when the budget is spent."""
+        with self._lock:
+            self._refill(time.monotonic())
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
+    def wait_time(self) -> float:
+        """Seconds until the next token, so a caller can sleep exactly that."""
+        with self._lock:
+            self._refill(time.monotonic())
+            if self._tokens >= 1.0:
+                return 0.0
+            return (1.0 - self._tokens) / self.rate
+
+
+_RATE_LOCK = threading.Lock()
+_SHARED_LIMITER: Optional[RateLimiter] = None
+
+
+def configure_rate_limit(rate: Optional[float]) -> Optional[RateLimiter]:
+    """Set (or clear, with None) the process-wide probe rate ceiling."""
+    global _SHARED_LIMITER
+    with _RATE_LOCK:
+        _SHARED_LIMITER = RateLimiter(rate) if rate else None
+        return _SHARED_LIMITER
+
+
+def shared_rate_limiter() -> Optional[RateLimiter]:
+    with _RATE_LOCK:
+        return _SHARED_LIMITER
+
+
 def default_socket_budget() -> int:
     """Probe sockets this process can comfortably keep open at once."""
     if sys.platform == "win32":  # pragma: no cover - platform specific
@@ -898,6 +961,7 @@ def _sweep_pass(
     on_timeout: Optional[Callable[[int], None]] = None,
     stop_event: Optional[threading.Event] = None,
     should_abort: Optional[Callable[[], bool]] = None,
+    limiter: Optional[RateLimiter] = None,
 ) -> tuple[list[int], list[int]]:
     """Probe every port in ``ports`` once, driving all sockets from one thread.
 
@@ -936,7 +1000,11 @@ def _sweep_pass(
                 break
 
             # 1. Top up the in-flight set.
+            throttled = False
             while index < len(ports) and len(live) < max_inflight:
+                if limiter is not None and not limiter.acquire():
+                    throttled = True
+                    break
                 if not budget.acquire():
                     break
                 port = ports[index]
@@ -979,8 +1047,11 @@ def _sweep_pass(
             if not live:
                 if index >= len(ports):
                     break
-                # Budget momentarily held by other hosts; yield briefly.
-                time.sleep(0.005)
+                # Nothing in flight and nothing may start: either the rate
+                # limiter is holding us back, in which case sleep exactly
+                # until a token is due, or another host has the budget.
+                idle = limiter.wait_time() if throttled else 0.005
+                time.sleep(min(max(idle, 0.001), POLL_INTERVAL))
                 continue
 
             # 2. Wait for completions, but never past the nearest deadline.
@@ -992,6 +1063,10 @@ def _sweep_pass(
                 wait_for = min(
                     POLL_INTERVAL, max(0.0, oldest - time.monotonic())
                 )
+            if throttled and limiter is not None:
+                # Wake when a token is due, so throttling costs latency on the
+                # next probe rather than a full poll interval.
+                wait_for = min(wait_for, max(limiter.wait_time(), 0.001))
             for key, _ in selector.select(timeout=wait_for):
                 probe = key.data
                 retire(probe)
@@ -1056,6 +1131,7 @@ def _connect_sweep(
     budget: Optional[SocketBudget] = None,
     early_exit: bool = True,
     timer: Optional[AdaptiveTimeout] = None,
+    limiter: Optional[RateLimiter] = None,
 ) -> _SweepOutcome:
     """Sweep one host's ports, reporting each verdict as it lands.
 
@@ -1069,6 +1145,7 @@ def _connect_sweep(
     endpoint = resolve_endpoint(host)
     budget = budget if budget is not None else shared_socket_budget()
     timer = timer if timer is not None else AdaptiveTimeout(timeout)
+    limiter = limiter if limiter is not None else shared_rate_limiter()
     queue = order_ports(ports)
     priority = {p for p in SSH_PRIORITY_PORTS if p in set(queue)}
     # Priority ports that answered nothing -- the only ones worth a retry.
@@ -1111,6 +1188,7 @@ def _connect_sweep(
             on_timeout=(lambda p: record(p, FILTERED, None)) if final else None,
             stop_event=stop_event,
             should_abort=gate.tripped if gate is not None else None,
+            limiter=limiter,
         )
         if unresolved:
             if gate is not None and gate.tripped():
@@ -1191,7 +1269,84 @@ def _reprobe_ssh_ports(
         budget=budget,
         on_result=record,
         stop_event=stop_event,
+        limiter=shared_rate_limiter(),
     )
+
+
+def _proxy_sweep(
+    host: str,
+    ports: list[int],
+    *,
+    proxy: SocksProxy,
+    timeout: float,
+    max_inflight: int,
+    stop_event: Optional[threading.Event] = None,
+    progress: Optional[ProgressReporter] = None,
+    on_open: Optional[Callable[[int, Optional[socket.socket]], bool]] = None,
+    limiter: Optional[RateLimiter] = None,
+) -> _SweepOutcome:
+    """Sweep a host through a SOCKS5 proxy, on a bounded pool of threads.
+
+    A SOCKS connection is a three-step conversation, not a single connect, so
+    it does not fit the selector engine's one-event-per-socket model. Rather
+    than complicate the loop every other feature depends on, the proxy path
+    is kept separate: the tunnel is the bottleneck anyway, and a pivot is used
+    to reach a handful of hosts rather than to sweep an estate at speed.
+    """
+    outcome = _SweepOutcome()
+    if not ports:
+        return outcome
+    limiter = limiter if limiter is not None else shared_rate_limiter()
+    queue = order_ports(ports)
+    lock = threading.Lock()
+
+    def probe(port: int):
+        if stop_event is not None and stop_event.is_set():
+            return port, None, None
+        while limiter is not None and not limiter.acquire():
+            if stop_event is not None and stop_event.is_set():
+                return port, None, None
+            time.sleep(min(max(limiter.wait_time(), 0.001), POLL_INTERVAL))
+        try:
+            status, sock = socks_connect(proxy, host, port, timeout)
+        except ProxyError:
+            raise
+        except OSError:
+            return port, FILTERED, None
+        return port, status, sock
+
+    pool = ThreadPoolExecutor(max_workers=max(1, min(max_inflight, 64)))
+    futures = {pool.submit(probe, port): port for port in queue}
+    try:
+        for future in as_completed(futures):
+            if stop_event is not None and stop_event.is_set():
+                break
+            port, status, sock = future.result()
+            if status is None:
+                continue
+            with lock:
+                if status == OPEN:
+                    outcome.open_ports.append(port)
+                elif status == CLOSED:
+                    outcome.closed += 1
+                else:
+                    outcome.filtered += 1
+                outcome.probed += 1
+            if status == OPEN:
+                if progress is not None:
+                    progress.log(
+                        f"  [+] open   {host}:{port}  (identifying...)"
+                    )
+                if not (on_open is not None and on_open(port, sock)):
+                    _close_quietly(sock)
+            if progress is not None:
+                progress.tick(1, opened=1 if status == OPEN else 0)
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False)
+    outcome.open_ports.sort()
+    return outcome
 
 
 def connect_scan_host(
@@ -1316,6 +1471,220 @@ def _chunk(items: list, size: int) -> Iterator[list]:
 # --------------------------------------------------------------------------- #
 # SSH validation
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Scanning through a SOCKS5 proxy
+# --------------------------------------------------------------------------- #
+SOCKS_VERSION = 0x05
+SOCKS_AUTH_NONE = 0x00
+SOCKS_AUTH_USERPASS = 0x02
+SOCKS_CMD_CONNECT = 0x01
+SOCKS_ADDR_IPV4 = 0x01
+SOCKS_ADDR_DOMAIN = 0x03
+SOCKS_ADDR_IPV6 = 0x04
+# RFC 1928 reply codes, mapped to the verdicts this tool speaks.
+SOCKS_REPLY_STATUS = {
+    0x00: OPEN,
+    0x01: FILTERED,   # general failure
+    0x02: FILTERED,   # not allowed by ruleset
+    0x03: FILTERED,   # network unreachable
+    0x04: FILTERED,   # host unreachable
+    0x05: CLOSED,     # connection refused -- the target answered with a RST
+    0x06: FILTERED,   # TTL expired
+    0x07: FILTERED,   # command not supported
+    0x08: FILTERED,   # address type not supported
+}
+
+
+@dataclass(frozen=True)
+class SocksProxy:
+    """A SOCKS5 proxy to reach the targets through."""
+
+    host: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+    def __str__(self) -> str:
+        return f"{self.host}:{self.port}"
+
+
+class ProxyError(OSError):
+    """The proxy refused, failed, or spoke something other than SOCKS5."""
+
+
+def parse_socks(spec: str) -> SocksProxy:
+    """Parse ``[user:pass@]host:port``.
+
+    Raises:
+        ValueError: if the specification is malformed.
+    """
+    credentials = None
+    remainder = spec.strip()
+    if not remainder:
+        raise ValueError("empty proxy specification")
+    if "@" in remainder:
+        credentials, _, remainder = remainder.rpartition("@")
+    if ":" not in remainder:
+        raise ValueError(f"proxy needs host:port, got {spec!r}")
+    host, _, port_text = remainder.rpartition(":")
+    if not host:
+        raise ValueError(f"proxy needs a host, got {spec!r}")
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise ValueError(f"invalid proxy port: {port_text!r}")
+    _validate_port(port)
+
+    username = password = None
+    if credentials is not None:
+        username, _, password = credentials.partition(":")
+        if not username:
+            raise ValueError(f"proxy needs a username before ':', got {spec!r}")
+    return SocksProxy(host=host, port=port, username=username,
+                      password=password)
+
+
+def socks_connect(
+    proxy: SocksProxy, host: str, port: int, timeout: float
+) -> tuple:
+    """Open a tunnel to ``host:port`` through ``proxy``.
+
+    Returns ``(status, socket_or_None)``. A refused target yields ``CLOSED``
+    and no socket, exactly as a direct scan would, because the proxy reports
+    what it saw rather than swallowing it.
+
+    Raises:
+        ProxyError: if the proxy itself is unreachable or misbehaves. That is
+            a scan-wide problem, not a verdict about this port, and must not
+            be mistaken for one.
+    """
+    try:
+        sock = socket.create_connection((proxy.host, proxy.port),
+                                        timeout=timeout)
+    except OSError as exc:
+        raise ProxyError(f"cannot reach proxy {proxy}: {exc}") from exc
+
+    try:
+        sock.settimeout(timeout)
+        reader = _BufferedReader(sock, timeout)
+        _socks_authenticate(sock, reader, proxy)
+        status = _socks_request(sock, reader, host, port)
+    except ProxyError:
+        _close_quietly(sock)
+        raise
+    except OSError as exc:
+        _close_quietly(sock)
+        raise ProxyError(f"proxy {proxy} failed: {exc}") from exc
+
+    if status != OPEN:
+        _close_quietly(sock)
+        return status, None
+    return OPEN, sock
+
+
+def _socks_authenticate(
+    sock: socket.socket, reader: "_BufferedReader", proxy: SocksProxy
+) -> None:
+    methods = [SOCKS_AUTH_NONE]
+    if proxy.username:
+        methods.append(SOCKS_AUTH_USERPASS)
+    sock.sendall(
+        bytes([SOCKS_VERSION, len(methods)]) + bytes(methods)
+    )
+    reply = reader.read_exact(2)
+    if reply[0] != SOCKS_VERSION:
+        raise ProxyError(f"proxy {proxy} is not SOCKS5")
+    chosen = reply[1]
+    if chosen == SOCKS_AUTH_NONE:
+        return
+    if chosen != SOCKS_AUTH_USERPASS or not proxy.username:
+        raise ProxyError(
+            f"proxy {proxy} requires an authentication method we cannot offer"
+        )
+    user = proxy.username.encode("utf-8")
+    secret = (proxy.password or "").encode("utf-8")
+    if len(user) > 255 or len(secret) > 255:
+        raise ProxyError("proxy credentials are too long for SOCKS5")
+    sock.sendall(
+        bytes([0x01, len(user)]) + user + bytes([len(secret)]) + secret
+    )
+    auth_reply = reader.read_exact(2)
+    if auth_reply[1] != 0x00:
+        raise ProxyError(f"proxy {proxy} rejected the credentials")
+
+
+def _socks_request(
+    sock: socket.socket, reader: "_BufferedReader", host: str, port: int
+) -> str:
+    """Ask the proxy to connect onward, and translate its reply."""
+    try:
+        packed = socket.inet_aton(host)
+        address = bytes([SOCKS_ADDR_IPV4]) + packed
+    except OSError:
+        try:
+            packed = socket.inet_pton(socket.AF_INET6, host)
+            address = bytes([SOCKS_ADDR_IPV6]) + packed
+        except OSError:
+            encoded = host.encode("idna") if host.isascii() else host.encode()
+            if len(encoded) > 255:
+                raise ProxyError("target hostname is too long for SOCKS5")
+            address = bytes([SOCKS_ADDR_DOMAIN, len(encoded)]) + encoded
+    sock.sendall(
+        bytes([SOCKS_VERSION, SOCKS_CMD_CONNECT, 0x00])
+        + address
+        + struct.pack(">H", port)
+    )
+    reply = reader.read_exact(4)
+    if reply[0] != SOCKS_VERSION:
+        raise ProxyError("proxy sent a malformed reply")
+    status = SOCKS_REPLY_STATUS.get(reply[1], FILTERED)
+    # Drain the bound address so the tunnel starts at the payload.
+    kind = reply[3]
+    if kind == SOCKS_ADDR_IPV4:
+        reader.read_exact(4 + 2)
+    elif kind == SOCKS_ADDR_IPV6:
+        reader.read_exact(16 + 2)
+    elif kind == SOCKS_ADDR_DOMAIN:
+        length = reader.read_exact(1)[0]
+        reader.read_exact(length + 2)
+    else:
+        raise ProxyError("proxy sent an unknown address type")
+    return status
+
+
+_PROXY_LOCK = threading.Lock()
+_SHARED_PROXY: Optional[SocksProxy] = None
+
+
+def configure_proxy(proxy: Optional[SocksProxy]) -> Optional[SocksProxy]:
+    """Set (or clear, with None) the proxy every connection goes through."""
+    global _SHARED_PROXY
+    with _PROXY_LOCK:
+        _SHARED_PROXY = proxy
+        return _SHARED_PROXY
+
+
+def shared_proxy() -> Optional[SocksProxy]:
+    with _PROXY_LOCK:
+        return _SHARED_PROXY
+
+
+def open_connection(host: str, port: int, timeout: float) -> socket.socket:
+    """Connect to ``host:port``, through the configured proxy if there is one.
+
+    Every connection this tool makes goes through here, so a pivot applies to
+    the banner exchange and the audit as well as to discovery. Scanning half
+    through a proxy would produce results nobody could interpret.
+    """
+    proxy = shared_proxy()
+    if proxy is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    status, sock = socks_connect(proxy, host, port, timeout)
+    if sock is None:
+        raise OSError(f"proxy could not reach {host}:{port} ({status})")
+    return sock
+
+
 class _BufferedReader:
     """Line and fixed-length reads over one socket, sharing a read buffer.
 
@@ -1414,7 +1783,7 @@ def grab_ssh_banner(
     connection = sock
     try:
         if connection is None:
-            connection = socket.create_connection((host, port), timeout=timeout)
+            connection = open_connection(host, port, timeout)
         connection.setblocking(True)
         connection.settimeout(timeout)
         connection.sendall(CLIENT_BANNER)
@@ -1444,7 +1813,8 @@ def validate_ssh_paramiko(host: str, port: int, timeout: float) -> Optional[str]
 
     transport = None
     try:
-        transport = paramiko.Transport((host, port))
+        # Paramiko accepts a live socket, so the pivot applies here too.
+        transport = paramiko.Transport(open_connection(host, port, timeout))
         transport.start_client(timeout=timeout)
         return transport.remote_version
     except Exception:
@@ -1588,7 +1958,7 @@ def read_server_kexinit(
     connection = sock
     try:
         if connection is None:
-            connection = socket.create_connection((host, port), timeout=timeout)
+            connection = open_connection(host, port, timeout)
         connection.setblocking(True)
         connection.settimeout(timeout)
         connection.sendall(CLIENT_BANNER)
@@ -1892,7 +2262,8 @@ def _audit_with_paramiko(
     except ImportError:
         raise _ParamikoUnavailable
 
-    transport = paramiko.Transport((host, port))
+    # Paramiko accepts a live socket, so the pivot applies here too.
+    transport = paramiko.Transport(open_connection(host, port, timeout))
     try:
         transport.start_client(timeout=timeout)
         key = transport.get_remote_server_key()
@@ -2555,6 +2926,20 @@ def scan_host(
             result.open_ports = open_ports
             result.closed = closed
             result.filtered = filtered
+        elif shared_proxy() is not None:
+            outcome = _proxy_sweep(
+                host,
+                ports,
+                proxy=shared_proxy(),
+                timeout=timeout,
+                max_inflight=max(1, workers),
+                stop_event=stop_event,
+                progress=progress,
+                on_open=handle_open,
+            )
+            result.open_ports = outcome.open_ports
+            result.closed = outcome.closed
+            result.filtered = outcome.filtered
         else:
             outcome = _connect_sweep(
                 host,
@@ -3402,6 +3787,20 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default: {DEFAULT_WORKERS}); --max-sockets is the hard ceiling.",
     )
     parser.add_argument(
+        "--max-rate",
+        type=float,
+        default=0.0,
+        help="Cap probes per second across the whole scan (default: no cap). "
+        "Concurrency bounds how many connections are open at once; this "
+        "bounds how fast new ones start.",
+    )
+    parser.add_argument(
+        "--socks",
+        help="Reach every target through a SOCKS5 proxy, as "
+        "'[user:pass@]host:port'. Discovery, the banner exchange and the "
+        "audit all go through it.",
+    )
+    parser.add_argument(
         "--max-sockets",
         type=int,
         default=0,
@@ -3532,6 +3931,18 @@ def run(argv: Optional[list[str]] = None) -> int:
         parser.error("max-targets must be >= 1")
     if args.max_sockets < 0:
         parser.error("max-sockets must be >= 0")
+    if args.max_rate < 0:
+        parser.error("max-rate must be >= 0")
+
+    proxy = None
+    if args.socks:
+        try:
+            proxy = parse_socks(args.socks)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.scan_method == "syn" and proxy is not None:
+        parser.error("--socks cannot be combined with a SYN scan; SOCKS5 "
+                     "carries TCP streams, not raw packets")
 
     # --json predates --format and stays a shorthand for it. Asking for two
     # different formats at once has no sensible reading, so say so rather than
@@ -3550,6 +3961,8 @@ def run(argv: Optional[list[str]] = None) -> int:
 
     if args.max_sockets:
         configure_socket_budget(args.max_sockets)
+    configure_rate_limit(args.max_rate or None)
+    configure_proxy(proxy)
 
     scan_method = resolve_scan_method(args.scan_method)
     if scan_method == "syn" and not has_raw_socket_privilege():
